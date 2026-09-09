@@ -58,6 +58,7 @@ python3 ~/Lab/hypr-awesome/hawesome.py &
 hawesome-ctl.py cycle-mode      # advance mode for current WS×mon
 hawesome-ctl.py cycle-variant   # advance variant for current mode
 hawesome-ctl.py status          # JSON: current WS×mon state
+hawesome-ctl.py status:eDP-1    # JSON: state for named monitor's active WS
 hawesome-ctl.py dump            # JSON: full state dict
 ```
 
