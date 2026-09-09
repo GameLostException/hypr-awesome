@@ -63,8 +63,26 @@ hawesome-ctl.py dump            # JSON: full state dict
 
 ## Planned (phase 2)
 
-- **Persistence** — save/restore state dict to `~/.config/hypr-awesome/state.json`
-- **Window arrangement snapshots** — save window positions per WS×mon, restore on switch
+- **Persistence** — save/restore layout state dict to `~/.config/hypr-awesome/state.json` on every change, keyed by `(ws_slot, monitor_name)` for stability across restarts
+
+## Planned (phase 3)
+
+- **Session save/restore** — on Hyprland exit, record all open windows (class, WS, monitor)
+  via `hyprctl clients -j`. On next launch, re-launch each app and move its window back to
+  the saved WS×screen. If a screen is gone, fall back to current active screen.
+  
+  Implementation notes:
+  - Save trigger: `hyprland:shutdown` IPC event or systemd `ExecStopPost`
+  - Restore: map `window class → launch command` via `.desktop` file `Exec=` field (~80%
+    coverage), with a hardcoded exceptions table for the rest
+  - Window placement is async: launch app, wait for `openwindow` IPC event matching the
+    class, then dispatch `movetoworkspacesilent`
+  - Separate script: `hawesome-session.py` (not part of the main daemon)
+  
+  Alternatives to evaluate first:
+  - [`wayland-session-manager`](https://github.com/tw4452852/wayland-session-manager)
+  - KDE's ksmserver approach (systemd session units per app)
+  - `systemd --user` service units with `PartOf=graphical-session.target`
 
 ## Notes
 

@@ -12,10 +12,11 @@ IPC:
   Exposes a control socket at /tmp/hawesome-<UID>.sock for hawesome-ctl.
 
 Commands accepted on control socket (newline-terminated):
-  cycle-mode       → advance mode for current WS×mon
-  cycle-variant    → advance variant for current mode on current WS×mon
-  status           → return JSON of current WS×mon state
-  dump             → return JSON of full state dict
+  cycle-mode            → advance mode for current WS×mon
+  cycle-variant         → advance variant for current mode on current WS×mon
+  status                → return JSON of current (focused) WS×mon state
+  status:<monitor>      → return JSON of active WS state on named monitor
+  dump                  → return JSON of full state dict
 """
 
 import asyncio
@@ -24,7 +25,6 @@ import logging
 import os
 import signal
 import subprocess
-import sys
 from pathlib import Path
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -49,15 +49,18 @@ VARIANT_CYCLE = {
 }
 
 # Default state for an unseen WS×mon combo
-DEFAULT_MODE    = "dwindle"
+DEFAULT_MODE     = "dwindle"
 DEFAULT_VARIANTS = {
     "dwindle": "h",
     "master":  "left",
 }
 
 # Control socket path (unique per user)
-UID         = os.getuid()
-CTL_SOCK    = f"/tmp/hawesome-{UID}.sock"
+UID      = os.getuid()
+CTL_SOCK = f"/tmp/hawesome-{UID}.sock"
+
+# Persistence file
+STATE_FILE = Path.home() / ".config" / "hypr-awesome" / "state.json"
 
 # ─── Hyprland IPC helpers ─────────────────────────────────────────────────────
 
@@ -65,7 +68,6 @@ def _hypr_sig() -> str:
     """Return the active Hyprland instance signature."""
     sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
     if not sig:
-        # Fall back: pick the most recently modified dir
         base = Path(f"/run/user/{UID}/hypr")
         dirs = sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         sig = dirs[0].name if dirs else ""
@@ -78,69 +80,47 @@ def _hypr_dir() -> Path:
 
 def hyprctl(*args: str) -> str:
     """Run hyprctl and return stdout."""
-    result = subprocess.run(
-        ["hyprctl", *args],
-        capture_output=True, text=True
-    )
+    result = subprocess.run(["hyprctl", *args], capture_output=True, text=True)
     return result.stdout.strip()
 
 
 def hyprctl_json(*args: str):
     """Run hyprctl and parse JSON output."""
-    raw = hyprctl(*args)
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
+        return json.loads(hyprctl(*args))
+    except (json.JSONDecodeError, ValueError):
         return None
 
 
 def get_active_ws_mon() -> tuple[int, str]:
-    """Return (workspace_id, monitor_name) of the currently focused window/workspace."""
-    ws   = hyprctl_json("activeworkspace", "-j") or {}
-    mon  = hyprctl_json("monitors", "-j") or []
+    """Return (workspace_id, monitor_name) of the currently focused workspace."""
+    ws  = hyprctl_json("activeworkspace", "-j") or {}
+    mon = hyprctl_json("monitors", "-j") or []
     ws_id   = ws.get("id", 1)
-    # Find the focused monitor
     focused = next((m["name"] for m in mon if m.get("focused")), "")
     return ws_id, focused
 
+
+def get_ws_mon_for_monitor(monitor_name: str) -> tuple[int, str]:
+    """Return (active_workspace_id, monitor_name) for a specific monitor."""
+    monitors = hyprctl_json("monitors", "-j") or []
+    for m in monitors:
+        if m["name"] == monitor_name:
+            return m["activeWorkspace"]["id"], monitor_name
+    # Monitor not found — fall back to focused
+    return get_active_ws_mon()
+
+
+def ws_slot_name(ws_id: int) -> str:
+    """
+    Resolve a Hyprland workspace id to its human-readable slot name ("1"–"8").
+    Falls back to str(ws_id) if the workspace isn't found.
+    """
+    workspaces = hyprctl_json("workspaces", "-j") or []
+    ws = next((w for w in workspaces if w["id"] == ws_id), None)
+    return ws["name"] if ws else str(ws_id)
+
 # ─── Layout application ───────────────────────────────────────────────────────
-
-def apply_layout(mode: str, variant: str | None) -> None:
-    """Push the given mode+variant to Hyprland."""
-    if mode == "monocle":
-        # monocle = master layout with one master window taking all space
-        # We use Hyprland's built-in monocle (keyword general:layout monocle)
-        hyprctl("keyword", "general:layout", "monocle")
-
-    elif mode == "dwindle":
-        hyprctl("keyword", "general:layout", "dwindle")
-        # Apply split direction: h = horizontal split, v = vertical split
-        # Hyprland dwindle: pseudotile doesn't control this directly.
-        # We use layoutmsg togglesplit only when the current split doesn't match.
-        # To set absolute direction we track it ourselves and togglesplit as needed.
-        _apply_dwindle_split(variant or "h")
-
-    elif mode == "master":
-        hyprctl("keyword", "general:layout", "master")
-        orientation = variant or "left"
-        hyprctl("keyword", "master:orientation", orientation)
-
-
-def _apply_dwindle_split(target: str) -> None:
-    """
-    Ensure dwindle split matches target ("h" or "v").
-    We read the current dwindle:force_split option to decide whether to togglesplit.
-    Since Hyprland doesn't expose "current split direction" directly per-window,
-    we track it ourselves and just call togglesplit when we need to change it.
-    This is called on mode application, so a single togglesplit aligns the view.
-    """
-    # We can't query current split state from hyprctl, so we unconditionally
-    # call layoutmsg togglesplit here only when SWITCHING to dwindle from another
-    # mode — the state is already tracked in our dict and applied correctly on
-    # workspace switch. On a direct cycle-variant call we always togglesplit.
-    # This function is called from apply_layout which is the single source of truth.
-    pass  # split is applied via explicit layoutmsg in the command handlers below
-
 
 def apply_dwindle_togglesplit() -> None:
     """Issue a dwindle togglesplit dispatch."""
@@ -155,35 +135,85 @@ def apply_master_orientation(orientation: str) -> None:
 
 class LayoutState:
     def __init__(self):
-        # key: (ws_id: int, monitor: str)
-        # value: {"mode": str, "variants": {"dwindle": str, "master": str}}
+        # Runtime dict: key (ws_id: int, monitor: str)
         self._state: dict[tuple[int, str], dict] = {}
+        # Persisted dict: key "slot@monitor" — loaded at startup, merged lazily
+        self._saved: dict[str, dict] = {}
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+
+    def load(self) -> None:
+        """Load state from disk into _saved. Called once at startup."""
+        try:
+            text = STATE_FILE.read_text()
+            self._saved = json.loads(text)
+            log.info("Loaded %d saved layout(s) from %s", len(self._saved), STATE_FILE)
+        except FileNotFoundError:
+            log.info("No saved state file — starting fresh")
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("Could not load state file: %s", e)
+
+    def save(self) -> None:
+        """
+        Persist current state to disk asynchronously.
+        Keys are 'slot@monitor' for human readability and restart stability.
+        """
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            out: dict[str, dict] = {}
+            for (ws_id, mon), s in self._state.items():
+                slot = ws_slot_name(ws_id)
+                out[f"{slot}@{mon}"] = {
+                    "mode":     s["mode"],
+                    "variants": dict(s["variants"]),
+                }
+            # Merge with _saved so entries for currently-unseen combos are kept
+            merged = {**self._saved, **out}
+            STATE_FILE.write_text(json.dumps(merged, indent=2))
+        except OSError as e:
+            log.warning("Could not save state: %s", e)
+
+    # ── State access ─────────────────────────────────────────────────────────
 
     def _default(self) -> dict:
         return {
-            "mode": DEFAULT_MODE,
+            "mode":     DEFAULT_MODE,
             "variants": dict(DEFAULT_VARIANTS),
         }
 
+    def _saved_for(self, ws_id: int, mon: str) -> dict | None:
+        """Look up saved state for a WS×mon by resolving its slot name."""
+        slot = ws_slot_name(ws_id)
+        key  = f"{slot}@{mon}"
+        raw  = self._saved.get(key)
+        if raw is None:
+            return None
+        # Validate and fill missing variant keys
+        entry = self._default()
+        entry["mode"] = raw.get("mode", DEFAULT_MODE)
+        entry["variants"].update(raw.get("variants", {}))
+        return entry
+
     def get(self, ws: int, mon: str) -> dict:
+        """Return state for (ws, mon), initialising from saved data if first seen."""
         key = (ws, mon)
         if key not in self._state:
-            self._state[key] = self._default()
+            saved = self._saved_for(ws, mon)
+            self._state[key] = saved if saved is not None else self._default()
         return self._state[key]
 
+    # ── Mutations ────────────────────────────────────────────────────────────
+
     def cycle_mode(self, ws: int, mon: str) -> dict:
-        s = self.get(ws, mon)
+        s   = self.get(ws, mon)
         idx = MODE_CYCLE.index(s["mode"])
         s["mode"] = MODE_CYCLE[(idx + 1) % len(MODE_CYCLE)]
         return s
 
     def cycle_variant(self, ws: int, mon: str) -> tuple[dict, bool]:
-        """
-        Cycle variant for current mode.
-        Returns (state, changed) — changed=False if mode has no variants.
-        """
-        s = self.get(ws, mon)
-        mode = s["mode"]
+        """Returns (state, changed) — changed=False if mode has no variants."""
+        s     = self.get(ws, mon)
+        mode  = s["mode"]
         cycle = VARIANT_CYCLE.get(mode, [])
         if not cycle:
             return s, False
@@ -194,14 +224,16 @@ class LayoutState:
 
     def current_variant(self, ws: int, mon: str) -> str | None:
         s = self.get(ws, mon)
-        mode = s["mode"]
-        return s["variants"].get(mode)
+        return s["variants"].get(s["mode"])
+
+    # ── Serialisation ────────────────────────────────────────────────────────
 
     def to_json(self, ws: int, mon: str) -> str:
         s = self.get(ws, mon)
         return json.dumps({
-            "ws": ws, "mon": mon,
-            "mode": s["mode"],
+            "ws":      ws,
+            "mon":     mon,
+            "mode":    s["mode"],
             "variant": self.current_variant(ws, mon),
             "variants": s["variants"],
         })
@@ -217,7 +249,7 @@ class LayoutState:
 
 class HawesomeDaemon:
     def __init__(self):
-        self.state = LayoutState()
+        self.state     = LayoutState()
         self._last_ws:  int = -1
         self._last_mon: str = ""
 
@@ -244,7 +276,6 @@ class HawesomeDaemon:
             return
         event, _, data = line.partition(">>")
 
-        # workspace>>ID  — fired when the focused workspace changes
         if event == "workspace":
             try:
                 ws_id = int(data)
@@ -253,7 +284,6 @@ class HawesomeDaemon:
             _, mon = get_active_ws_mon()
             await self._on_focus_change(ws_id, mon)
 
-        # focusedmon>>MONNAME,WSID  — fired when focus moves to another monitor
         elif event == "focusedmon":
             parts = data.split(",")
             if len(parts) < 2:
@@ -268,11 +298,11 @@ class HawesomeDaemon:
     async def _on_focus_change(self, ws: int, mon: str) -> None:
         """Apply saved layout when WS×mon focus changes."""
         if ws == self._last_ws and mon == self._last_mon:
-            return  # nothing changed
+            return
         self._last_ws  = ws
         self._last_mon = mon
 
-        s = self.state.get(ws, mon)
+        s       = self.state.get(ws, mon)
         mode    = s["mode"]
         variant = self.state.current_variant(ws, mon)
         log.info("Focus → ws=%d mon=%s → apply %s/%s", ws, mon, mode, variant or "—")
@@ -282,7 +312,6 @@ class HawesomeDaemon:
 
     async def serve_ctl(self) -> None:
         """Serve the control socket for hawesome-ctl commands."""
-        # Remove stale socket
         try:
             os.unlink(CTL_SOCK)
         except FileNotFoundError:
@@ -297,8 +326,8 @@ class HawesomeDaemon:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            raw = await reader.readline()
-            cmd = raw.decode().strip()
+            raw   = await reader.readline()
+            cmd   = raw.decode().strip()
             reply = await self._dispatch_cmd(cmd)
             writer.write((reply + "\n").encode())
             await writer.drain()
@@ -310,12 +339,13 @@ class HawesomeDaemon:
         ws, mon = get_active_ws_mon()
 
         if cmd == "cycle-mode":
-            s = self.state.cycle_mode(ws, mon)
+            s       = self.state.cycle_mode(ws, mon)
             mode    = s["mode"]
             variant = self.state.current_variant(ws, mon)
             log.info("cycle-mode → ws=%d mon=%s → %s/%s", ws, mon, mode, variant or "—")
             self._apply(mode, variant)
             self._notify_waybar()
+            asyncio.get_event_loop().call_soon(self.state.save)
             return self.state.to_json(ws, mon)
 
         elif cmd == "cycle-variant":
@@ -326,12 +356,20 @@ class HawesomeDaemon:
                 log.info("cycle-variant → ws=%d mon=%s → %s/%s", ws, mon, mode, variant)
                 self._apply_variant(mode, variant)
                 self._notify_waybar()
+                asyncio.get_event_loop().call_soon(self.state.save)
             else:
                 log.info("cycle-variant → no variants for mode=%s", mode)
             return self.state.to_json(ws, mon)
 
         elif cmd == "status":
+            # Status for currently focused WS×mon
             return self.state.to_json(ws, mon)
+
+        elif cmd.startswith("status:"):
+            # Status for a specific monitor's active WS: "status:DP-5"
+            target_mon = cmd[7:]
+            ws_for_mon, _ = get_ws_mon_for_monitor(target_mon)
+            return self.state.to_json(ws_for_mon, target_mon)
 
         elif cmd == "dump":
             return self.state.dump_json()
@@ -348,9 +386,8 @@ class HawesomeDaemon:
 
         elif mode == "dwindle":
             hyprctl("keyword", "general:layout", "dwindle")
-            # Don't togglesplit on WS switch — the dwindle engine remembers
-            # its own split state per window tree. We only togglesplit on an
-            # explicit cycle-variant call.
+            # Don't togglesplit on WS switch — dwindle remembers its own
+            # per-node split state. We only togglesplit on explicit cycle-variant.
 
         elif mode == "master":
             hyprctl("keyword", "general:layout", "master")
@@ -359,20 +396,20 @@ class HawesomeDaemon:
     def _apply_variant(self, mode: str, variant: str | None) -> None:
         """Apply only the variant change for the current mode."""
         if mode == "dwindle":
-            # togglesplit cycles h↔v on the active split node
             apply_dwindle_togglesplit()
         elif mode == "master":
             apply_master_orientation(variant or "left")
         # monocle: noop
 
     def _notify_waybar(self) -> None:
-        """Signal waybar to refresh custom modules (signal 8 = RTMIN+8)."""
+        """Signal waybar to refresh custom modules (RTMIN+8)."""
         subprocess.run(["pkill", "-RTMIN+8", "waybar"], capture_output=True)
 
     # ── Entry point ──────────────────────────────────────────────────────────
 
     async def seed(self) -> None:
-        """Seed initial WS×mon state without applying layout (Hyprland already has one)."""
+        """Load persisted state and seed current WS×mon focus tracking."""
+        self.state.load()
         ws, mon = get_active_ws_mon()
         self._last_ws  = ws
         self._last_mon = mon
@@ -385,8 +422,7 @@ def main() -> None:
     daemon = HawesomeDaemon()
 
     async def _run() -> None:
-        loop = asyncio.get_running_loop()
-
+        loop       = asyncio.get_running_loop()
         stop_event = asyncio.Event()
 
         def _shutdown(sig_num: int) -> None:
@@ -398,7 +434,6 @@ def main() -> None:
 
         await daemon.seed()
 
-        # Run daemon tasks; cancel them cleanly when stop_event fires
         tasks = [
             asyncio.create_task(daemon.listen_hyprland()),
             asyncio.create_task(daemon.serve_ctl()),
@@ -408,13 +443,11 @@ def main() -> None:
 
         for t in tasks:
             t.cancel()
-        # Wait for cancellations to settle, suppress CancelledError
         await asyncio.gather(*tasks, return_exceptions=True)
 
     try:
         asyncio.run(_run())
     finally:
-        # Clean up control socket on exit
         try:
             os.unlink(CTL_SOCK)
         except FileNotFoundError:

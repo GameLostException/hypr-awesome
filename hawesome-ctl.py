@@ -3,10 +3,11 @@
 hawesome-ctl — send commands to the hawesome daemon.
 
 Usage:
-  hawesome-ctl cycle-mode      # SUP+M  — advance layout mode for current WS×mon
-  hawesome-ctl cycle-variant   # SUP+SHIFT+M — advance variant for current mode
-  hawesome-ctl status          # print current WS×mon layout as JSON
-  hawesome-ctl dump            # print full state dict as JSON
+  hawesome-ctl cycle-mode           # SUP+M  — advance layout mode for current WS×mon
+  hawesome-ctl cycle-variant        # SUP+SHIFT+M — advance variant for current mode
+  hawesome-ctl status               # print current (focused) WS×mon layout as JSON
+  hawesome-ctl status:<monitor>     # print layout for named monitor's active WS
+  hawesome-ctl dump                 # print full state dict as JSON
 """
 
 import json
@@ -24,7 +25,6 @@ def send(cmd: str) -> str:
             s.settimeout(2.0)
             s.connect(CTL_SOCK)
             s.sendall((cmd + "\n").encode())
-            # Read until connection closes
             chunks = []
             while True:
                 chunk = s.recv(4096)
@@ -43,18 +43,24 @@ def send(cmd: str) -> str:
         sys.exit(1)
 
 
-VALID_COMMANDS = {"cycle-mode", "cycle-variant", "status", "dump"}
-
-
 def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1] not in VALID_COMMANDS:
-        print(f"Usage: hawesome-ctl <{'|'.join(sorted(VALID_COMMANDS))}>", file=sys.stderr)
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
         sys.exit(1)
 
-    cmd    = sys.argv[1]
-    reply  = send(cmd)
+    cmd = sys.argv[1]
 
-    # Pretty-print JSON replies
+    # Validate command
+    valid = {"cycle-mode", "cycle-variant", "status", "dump"}
+    is_valid = cmd in valid or cmd.startswith("status:")
+    if not is_valid:
+        print(f"hawesome-ctl: unknown command '{cmd}'", file=sys.stderr)
+        print(f"Valid commands: {', '.join(sorted(valid))} | status:<monitor>",
+              file=sys.stderr)
+        sys.exit(1)
+
+    reply = send(cmd)
+
     try:
         parsed = json.loads(reply)
         print(json.dumps(parsed, indent=2))
