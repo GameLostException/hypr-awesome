@@ -155,14 +155,19 @@ class LayoutState:
 
     def save(self) -> None:
         """
-        Persist current state to disk asynchronously.
+        Persist current state to disk.
         Keys are 'slot@monitor' for human readability and restart stability.
         """
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            # Resolve all ws_ids to slot names in one hyprctl call
+            workspaces = hyprctl_json("workspaces", "-j") or []
+            id_to_slot = {w["id"]: w["name"] for w in workspaces}
+
             out: dict[str, dict] = {}
             for (ws_id, mon), s in self._state.items():
-                slot = ws_slot_name(ws_id)
+                slot = id_to_slot.get(ws_id, str(ws_id))
                 out[f"{slot}@{mon}"] = {
                     "mode":     s["mode"],
                     "variants": dict(s["variants"]),
@@ -345,7 +350,7 @@ class HawesomeDaemon:
             log.info("cycle-mode → ws=%d mon=%s → %s/%s", ws, mon, mode, variant or "—")
             self._apply(mode, variant)
             self._notify_waybar()
-            asyncio.get_event_loop().call_soon(self.state.save)
+            asyncio.get_running_loop().call_soon(self.state.save)
             return self.state.to_json(ws, mon)
 
         elif cmd == "cycle-variant":
@@ -356,7 +361,7 @@ class HawesomeDaemon:
                 log.info("cycle-variant → ws=%d mon=%s → %s/%s", ws, mon, mode, variant)
                 self._apply_variant(mode, variant)
                 self._notify_waybar()
-                asyncio.get_event_loop().call_soon(self.state.save)
+                asyncio.get_running_loop().call_soon(self.state.save)
             else:
                 log.info("cycle-variant → no variants for mode=%s", mode)
             return self.state.to_json(ws, mon)
