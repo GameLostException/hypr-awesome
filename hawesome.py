@@ -257,6 +257,7 @@ class HawesomeDaemon:
         self.state     = LayoutState()
         self._last_ws:  int = -1
         self._last_mon: str = ""
+        self._current_layout: str = ""   # last layout keyword sent to Hyprland
 
     # ── Hyprland event listener ──────────────────────────────────────────────
 
@@ -385,17 +386,32 @@ class HawesomeDaemon:
     # ── Layout application helpers ───────────────────────────────────────────
 
     def _apply(self, mode: str, variant: str | None) -> None:
-        """Full apply: set layout keyword + variant."""
+        """
+        Apply layout for the currently focused WS×mon.
+
+        general:layout is a global Hyprland keyword — it affects all monitors.
+        We only issue it when the mode actually differs from what's already
+        set, so focusing a monitor whose layout matches the current global
+        layout does not disturb the other monitors' active windows.
+
+        master:orientation is also global but is mode-specific state that
+        only matters when layout=master, so it's safe to set on every master
+        focus change.
+        """
         if mode == "monocle":
-            hyprctl("keyword", "general:layout", "monocle")
+            if self._current_layout != "monocle":
+                hyprctl("keyword", "general:layout", "monocle")
+                self._current_layout = "monocle"
 
         elif mode == "dwindle":
-            hyprctl("keyword", "general:layout", "dwindle")
-            # Don't togglesplit on WS switch — dwindle remembers its own
-            # per-node split state. We only togglesplit on explicit cycle-variant.
+            if self._current_layout != "dwindle":
+                hyprctl("keyword", "general:layout", "dwindle")
+                self._current_layout = "dwindle"
 
         elif mode == "master":
-            hyprctl("keyword", "general:layout", "master")
+            if self._current_layout != "master":
+                hyprctl("keyword", "general:layout", "master")
+                self._current_layout = "master"
             hyprctl("keyword", "master:orientation", variant or "left")
 
     def _apply_variant(self, mode: str, variant: str | None) -> None:
@@ -405,6 +421,7 @@ class HawesomeDaemon:
         elif mode == "master":
             apply_master_orientation(variant or "left")
         # monocle: noop
+        # _current_layout unchanged — variant changes don't switch the layout
 
     def _notify_waybar(self) -> None:
         """Signal waybar to refresh custom modules (RTMIN+8)."""
@@ -418,7 +435,14 @@ class HawesomeDaemon:
         ws, mon = get_active_ws_mon()
         self._last_ws  = ws
         self._last_mon = mon
-        log.info("Initial focus ws=%d mon=%s", ws, mon)
+        # Seed current layout from compositor so first focus change doesn't
+        # needlessly re-issue the keyword if it already matches.
+        try:
+            cfg = hyprctl_json("getoption", "general:layout")
+            self._current_layout = (cfg or {}).get("str", "")
+        except Exception:
+            self._current_layout = ""
+        log.info("Initial focus ws=%d mon=%s layout=%r", ws, mon, self._current_layout)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
