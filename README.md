@@ -7,40 +7,16 @@ Inspired by AwesomeWM's per-tag layout model.
 
 Each **(workspace, monitor)** combination independently remembers its own:
 - **layout mode** — `dwindle`, `monocle`, or `master`
-- **variant** — sub-state within the mode (e.g. dwindle split direction, master orientation)
+- **variant** — sub-state within the mode (dwindle split direction, master orientation)
 
-Switching workspace or monitor focus automatically restores the saved layout for that combo.  
-No combo ever clobbers another.
-
-## Hyprland layout constraint
-
-Hyprland has a single global `general:layout` keyword — there is no per-monitor or
-per-workspace layout API.  hawesome works around this as follows:
-
-- **On focus change** (workspace switch or monitor focus): hawesome sets `general:layout`
-  to the incoming WS×mon's mode.  This is the only moment it matters, since Hyprland's
-  layout engine only affects **newly tiled windows** — existing window positions and splits
-  are preserved per-workspace by Hyprland natively.
-
-- **What this means in practice**: each workspace's tiling is independent.  If ws A has
-  two windows split dwindle-style and ws B has three windows in master, switching between
-  them always shows the correct arrangement.  The global layout keyword only controls
-  which engine tiles the *next* window you open.  hawesome keeps it in sync with the
-  focused WS×mon so that window is always tiled correctly.
-
-- **The one real limitation**: two monitors cannot simultaneously use *different* tiling
-  engines for newly-opened windows.  If eDP-1 is in master mode and you open a window on
-  DP-5 (dwindle), the window on DP-5 will be tiled with master until focus returns to
-  DP-5.  This is an inherent Hyprland constraint, not a hawesome bug.  In practice it
-  is rarely noticeable because `general:layout` is always set correctly for the focused
-  monitor — the monitor you are actually working on.
+Switching workspace or monitor focus automatically restores the saved layout for that combo.
 
 ## Layout modes
 
-| Mode | Description | Variants (SUP+SHIFT+M) |
-|------|-------------|------------------------|
+| Mode | Description | Variants (`SUP+SHIFT+M`) |
+|------|-------------|--------------------------|
 | `dwindle` | Binary space partition | `h` (horizontal) ↔ `v` (vertical) |
-| `monocle` | All windows full-size, stacked | — (no variants) |
+| `monocle` | One window at a time; hover taskbar to cycle | — (no variants) |
 | `master` | One master + slave stack | `left` → `top` → `right` → `bottom` |
 
 ## Keybinds
@@ -50,15 +26,44 @@ per-workspace layout API.  hawesome works around this as follows:
 | `SUP+M` | Cycle layout mode for current WS×mon: dwindle → monocle → master → … |
 | `SUP+SHIFT+M` | Cycle variant for current mode (noop on monocle) |
 
+## Monocle implementation
+
+Monocle is **not** a Hyprland layout engine. It is simulated by hawesome:
+
+- **Enter**: all non-active tiled windows are moved to `special:monocle{ws_id}` (a hidden special workspace). The active window naturally expands to fill the space.
+- **Cycle** (`SUP+M` again while in monocle): the next stashed window is brought forward, the current one is stashed.
+- **Taskbar integration**: [wayapps](../wayapps/) includes stashed windows in the taskbar so you can hover or click to switch between them directly.
+- **Exit** (cycle to dwindle/master): all stashed windows are restored before the engine switch.
+- **Daemon restart**: any `special:monocleN` workspaces left from a previous session are automatically cleaned up on startup.
+
+## Layout engine switching (dwindle ↔ master)
+
+Hyprland assigns a tiling engine to each workspace permanently at creation. `general:layout` only affects newly created workspaces. To change an existing workspace's engine, hawesome:
+
+1. Sets `general:layout` to the target engine
+2. Moves the monitor to a temporary workspace `800+ws_id` (so the target workspace can be destroyed)
+3. Empties the target workspace → Hyprland destroys it
+4. Switches back → Hyprland recreates it under the new engine
+5. Moves all windows back → they tile under the new engine
+
+Focus events fired during this operation are suppressed via `_switching` flag + `asyncio.sleep(0.3)` drain.
+
+## Hyprland layout constraint
+
+`general:layout` is a single global keyword — no per-monitor or per-workspace layout API exists. hawesome works around this:
+
+- On focus change, `general:layout` is set to the incoming WS×mon's mode. This only matters for newly-opened windows; existing window positions are preserved per-workspace by Hyprland natively.
+- **Real limitation**: two monitors cannot simultaneously use different engines for new windows. If you open a new window while focused on a monitor with a different mode than its neighbor, the new window uses the focused monitor's engine. This is a Hyprland constraint, not a hawesome bug.
+
 ## Architecture
 
 ```
-hawesome.py        daemon — IPC listener + control socket server
+hawesome.py        daemon — asyncio IPC listener + control socket server
 hawesome-ctl.py    CLI — sends commands to daemon (called by keybinds)
-install.sh         setup helper
 ```
 
-Communication between daemon and ctl via Unix socket at `/tmp/hawesome-<UID>.sock`.
+State is persisted to `~/.config/hypr-awesome/state.json` as `slot@monitor` keys.  
+Control socket: `/tmp/hawesome-{uid}.sock`
 
 ## Install
 
@@ -67,51 +72,24 @@ cd ~/Lab/hypr-awesome
 bash install.sh
 ```
 
-Then add the printed snippets to `~/.config/hypr/hyprland.conf` and remove the old
-`toggle-monocle.sh` / `toggle-split.sh` binds.
-
-Restart Hyprland (or `exec-once` the daemon manually for a live session):
-```bash
-python3 ~/Lab/hypr-awesome/hawesome.py &
+Add to `hyprland.conf`:
+```ini
+exec-once = python3 ~/Lab/hypr-awesome/hawesome.py
 ```
 
 ## Control socket commands
 
 ```bash
-hawesome-ctl.py cycle-mode      # advance mode for current WS×mon
-hawesome-ctl.py cycle-variant   # advance variant for current mode
-hawesome-ctl.py status          # JSON: current WS×mon state
-hawesome-ctl.py status:eDP-1    # JSON: state for named monitor's active WS
-hawesome-ctl.py dump            # JSON: full state dict
+hawesome-ctl.py cycle-mode        # advance layout mode for current WS×mon
+hawesome-ctl.py cycle-variant     # advance variant for current mode
+hawesome-ctl.py status            # JSON: current WS×mon state
+hawesome-ctl.py status:eDP-1      # JSON: named monitor's active WS state
+hawesome-ctl.py dump              # JSON: full in-memory state
 ```
-
-## Planned (phase 2)
-
-- **Persistence** — save/restore layout state dict to `~/.config/hypr-awesome/state.json` on every change, keyed by `(ws_slot, monitor_name)` for stability across restarts
-
-## Planned (phase 3)
-
-- **Session save/restore** — on Hyprland exit, record all open windows (class, WS, monitor)
-  via `hyprctl clients -j`. On next launch, re-launch each app and move its window back to
-  the saved WS×screen. If a screen is gone, fall back to current active screen.
-  
-  Implementation notes:
-  - Save trigger: `hyprland:shutdown` IPC event or systemd `ExecStopPost`
-  - Restore: map `window class → launch command` via `.desktop` file `Exec=` field (~80%
-    coverage), with a hardcoded exceptions table for the rest
-  - Window placement is async: launch app, wait for `openwindow` IPC event matching the
-    class, then dispatch `movetoworkspacesilent`
-  - Separate script: `hawesome-session.py` (not part of the main daemon)
-  
-  Alternatives to evaluate first:
-  - [`wayland-session-manager`](https://github.com/tw4452852/wayland-session-manager)
-  - KDE's ksmserver approach (systemd session units per app)
-  - `systemd --user` service units with `PartOf=graphical-session.target`
 
 ## Notes
 
-- Requires Hyprland with `split-monitor-workspaces` plugin (already in your setup)
-- `monocle` uses Hyprland's built-in `monocle` layout keyword
-- Dwindle split direction is toggled via `layoutmsg togglesplit` (Hyprland doesn't expose a set-direction API)
-- Master orientation is set via `keyword master:orientation`
-- Waybar is signalled (RTMIN+8) after every mode change for custom module refresh
+- Requires Hyprland with `split-monitor-workspaces` plugin
+- State file uses `slot@monitor` keys (e.g. `"3@DP-5"`) for stability across restarts
+- Temp workspace IDs ≥ 800 are used during engine switches and never saved to state
+- `general:layout` is only issued when it differs from the last known value, to avoid disturbing other monitors on focus change

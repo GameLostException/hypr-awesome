@@ -314,11 +314,6 @@ class HawesomeDaemon:
             # pull the next stashed window into view.
             if self._monocle_ws and not self._switching:
                 self._monocle_restore_after_close()
-            try:
-                ws_id = int(parts[1])
-            except ValueError:
-                return
-            await self._on_focus_change(ws_id, mon)
 
     async def _on_focus_change(self, ws: int, mon: str) -> None:
         """Apply saved layout when WS×mon focus changes."""
@@ -423,8 +418,8 @@ class HawesomeDaemon:
           2. Move all tiled windows out (workspace is destroyed when empty)
           3. Move them back (workspace is recreated fresh with the new engine)
 
-        Monocle is simulated via fullscreen 1 (fake fullscreen) on the active
-        window — it is not a separate engine.
+        Monocle is simulated via a special stash workspace (special:monocleN)
+        that hides all non-active tiled windows.
 
         force_retile=True: apply the engine switch / monocle simulation.
                            Used on explicit cycle-mode (SUP+M).
@@ -634,9 +629,8 @@ class HawesomeDaemon:
             # _switching stays True — cleared by _clear_switching() scheduled below
 
     def _force_retile_active_ws(self) -> None:
-        """Legacy: kept for compatibility, now delegates to _switch_ws_engine."""
-        ws = hyprctl_json("activeworkspace", "-j") or {}
-        self._switch_ws_engine(self._current_layout)
+        """Unused legacy wrapper — kept so external tooling isn't broken."""
+        pass
 
     def _monocle_restore_after_close(self) -> None:
         """
