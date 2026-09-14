@@ -309,6 +309,17 @@ class HawesomeDaemon:
                 return
             await self._on_focus_change(ws_id, mon)
 
+        elif event == "closewindow":
+            # If a window closes while monocle is active on its workspace,
+            # pull the next stashed window into view.
+            if self._monocle_ws and not self._switching:
+                self._monocle_restore_after_close()
+            try:
+                ws_id = int(parts[1])
+            except ValueError:
+                return
+            await self._on_focus_change(ws_id, mon)
+
     async def _on_focus_change(self, ws: int, mon: str) -> None:
         """Apply saved layout when WS×mon focus changes."""
         # Suppress during _switch_ws_engine — it fires temp workspace events
@@ -451,34 +462,93 @@ class HawesomeDaemon:
 
     def _apply_monocle(self) -> None:
         """
-        Simulate monocle by fake-fullscreening the active window.
-        Tracks which workspace has monocle active so we can undo it.
+        Enter monocle mode: hide all non-active tiled windows by moving them
+        to a special stash workspace (special:monocleN). The active window
+        naturally expands to fill the workspace. Cycling focuses the next
+        stashed window by bringing it back and re-stashing the current one.
         """
         ws = hyprctl_json("activeworkspace", "-j") or {}
         ws_id = ws.get("id")
-        aw = hyprctl_json("activewindow", "-j") or {}
-        addr = aw.get("address", "")
-        if not addr or not ws_id:
+        if not ws_id:
             return
-        # If already in monocle on this ws, cycle to next window
+
+        aw = hyprctl_json("activewindow", "-j") or {}
+        active_addr = aw.get("address", "")
+
+        clients = hyprctl_json("clients", "-j") or []
+        tiled = [
+            c for c in clients
+            if c.get("workspace", {}).get("id") == ws_id
+            and not c.get("hidden")
+            and not c.get("floating")
+        ]
+
         if ws_id in self._monocle_ws:
-            hyprctl("dispatch", "cyclenext")
-        else:
-            hyprctl("dispatch", "fullscreen", "1")
+            # Already in monocle — cycle: bring next stashed window back,
+            # stash the current active one.
+            stash = f"special:monocle{ws_id}"
+            stashed = [
+                c for c in clients
+                if c.get("workspace", {}).get("name") == stash
+            ]
+            if stashed:
+                next_win = stashed[0]
+                batch = (
+                    f"dispatch movetoworkspacesilent {ws_id},address:{next_win['address']}"
+                )
+                if active_addr:
+                    batch += f" ; dispatch movetoworkspacesilent {stash},address:{active_addr}"
+                hyprctl("--batch", batch)
+                log.info("monocle cycle: ws=%d showed %s", ws_id, next_win.get("class"))
+            return
+
+        # Entering monocle: stash all non-active tiled windows
+        others = [c["address"] for c in tiled if c["address"] != active_addr]
+        if not others and len(tiled) <= 1:
+            # Only one window — nothing to hide, just mark monocle active
             self._monocle_ws.add(ws_id)
-        log.info("monocle: ws=%d active=%s", ws_id, addr)
+            log.info("monocle enter: ws=%d single window", ws_id)
+            return
+
+        stash = f"special:monocle{ws_id}"
+        batch = " ; ".join(
+            f"dispatch movetoworkspacesilent {stash},address:{a}" for a in others
+        )
+        hyprctl("--batch", batch)
+        self._monocle_ws.add(ws_id)
+        log.info("monocle enter: ws=%d stashed %d windows", ws_id, len(others))
 
     def _exit_monocle_if_active(self) -> None:
-        """Undo fullscreen if the active workspace has monocle simulation active."""
+        """
+        Exit monocle: restore all stashed windows back to their workspace.
+        Undo any fullscreen state on the active window.
+        """
         ws = hyprctl_json("activeworkspace", "-j") or {}
         ws_id = ws.get("id")
-        if ws_id and ws_id in self._monocle_ws:
-            # Check if active window is actually fullscreened
-            aw = hyprctl_json("activewindow", "-j") or {}
-            if aw.get("fullscreen", 0):
-                hyprctl("dispatch", "fullscreen", "1")  # toggle off
-            self._monocle_ws.discard(ws_id)
-            log.info("monocle exit: ws=%d", ws_id)
+        if not ws_id or ws_id not in self._monocle_ws:
+            return
+
+        stash = f"special:monocle{ws_id}"
+        clients = hyprctl_json("clients", "-j") or []
+        stashed = [
+            c for c in clients
+            if c.get("workspace", {}).get("name") == stash
+        ]
+
+        if stashed:
+            batch = " ; ".join(
+                f"dispatch movetoworkspacesilent {ws_id},address:{c['address']}"
+                for c in stashed
+            )
+            hyprctl("--batch", batch)
+            log.info("monocle exit: ws=%d restored %d windows", ws_id, len(stashed))
+
+        # Undo any fullscreen on the current window
+        aw = hyprctl_json("activewindow", "-j") or {}
+        if aw.get("fullscreen", 0):
+            hyprctl("dispatch", "fullscreen", "1")
+
+        self._monocle_ws.discard(ws_id)
 
     def _switch_ws_engine(self, layout: str) -> None:
         """
@@ -561,6 +631,33 @@ class HawesomeDaemon:
         """Legacy: kept for compatibility, now delegates to _switch_ws_engine."""
         ws = hyprctl_json("activeworkspace", "-j") or {}
         self._switch_ws_engine(self._current_layout)
+
+    def _monocle_restore_after_close(self) -> None:
+        """
+        After a window closes, if the active workspace is in monocle and has
+        stashed windows, bring the next one into view automatically.
+        """
+        ws = hyprctl_json("activeworkspace", "-j") or {}
+        ws_id = ws.get("id")
+        if not ws_id or ws_id not in self._monocle_ws:
+            return
+        # Check if workspace is now empty (the closed window was the last visible one)
+        clients = hyprctl_json("clients", "-j") or []
+        visible = [c for c in clients
+                   if c.get("workspace", {}).get("id") == ws_id
+                   and not c.get("hidden") and not c.get("floating")]
+        stash = f"special:monocle{ws_id}"
+        stashed = [c for c in clients
+                   if c.get("workspace", {}).get("name") == stash]
+        if not visible and stashed:
+            # Bring next stashed window back
+            hyprctl("dispatch",
+                    f"movetoworkspacesilent {ws_id},address:{stashed[0]['address']}")
+            log.info("monocle close recovery: ws=%d restored %s",
+                     ws_id, stashed[0].get("class"))
+        elif not visible and not stashed:
+            # No more windows — exit monocle state cleanly
+            self._monocle_ws.discard(ws_id)
 
     def _apply_variant(self, mode: str, variant: str | None) -> None:
         """Apply only the variant change for the current mode."""
