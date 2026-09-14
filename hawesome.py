@@ -167,6 +167,9 @@ class LayoutState:
 
             out: dict[str, dict] = {}
             for (ws_id, mon), s in self._state.items():
+                # Skip temp workspaces used by _switch_ws_engine (IDs ≥ 800)
+                if ws_id >= 800:
+                    continue
                 slot = id_to_slot.get(ws_id, str(ws_id))
                 out[f"{slot}@{mon}"] = {
                     "mode":     s["mode"],
@@ -201,6 +204,9 @@ class LayoutState:
 
     def get(self, ws: int, mon: str) -> dict:
         """Return state for (ws, mon), initialising from saved data if first seen."""
+        if ws >= 800:
+            # Temp workspace used by _switch_ws_engine — always return default, never persist
+            return self._default()
         key = (ws, mon)
         if key not in self._state:
             saved = self._saved_for(ws, mon)
@@ -257,8 +263,9 @@ class HawesomeDaemon:
         self.state            = LayoutState()
         self._last_ws:  int   = -1
         self._last_mon: str   = ""
-        self._current_layout: str = ""   # last layout keyword sent to Hyprland
-        self._monocle_ws: set[int] = set()  # workspace IDs with monocle active
+        self._current_layout: str  = ""        # last layout keyword sent to Hyprland
+        self._monocle_ws: set[int] = set()     # workspace IDs with monocle active
+        self._switching: bool = False           # True while _switch_ws_engine runs
 
     # ── Hyprland event listener ──────────────────────────────────────────────
 
@@ -304,6 +311,10 @@ class HawesomeDaemon:
 
     async def _on_focus_change(self, ws: int, mon: str) -> None:
         """Apply saved layout when WS×mon focus changes."""
+        # Suppress during _switch_ws_engine — it fires temp workspace events
+        # that would clobber the layout we're in the middle of setting.
+        if self._switching:
+            return
         if ws == self._last_ws and mon == self._last_mon:
             return
         self._last_ws  = ws
@@ -351,6 +362,10 @@ class HawesomeDaemon:
             variant = self.state.current_variant(ws, mon)
             log.info("cycle-mode → ws=%d mon=%s → %s/%s", ws, mon, mode, variant or "—")
             self._apply(mode, variant, force_retile=True)
+            # Clear _switching after yielding to the event loop so queued
+            # workspace events from _switch_ws_engine get ignored, not applied.
+            await asyncio.sleep(0.3)
+            self._switching = False
             self._notify_wayapps()
             asyncio.get_running_loop().call_soon(self.state.save)
             return self.state.to_json(ws, mon)
@@ -426,8 +441,11 @@ class HawesomeDaemon:
         if mode == "master":
             hyprctl("keyword", "master:orientation", variant or "left")
 
-        # On explicit cycle: if the active workspace's engine differs from the
-        # new mode, destroy-and-recreate it so it picks up the new engine.
+        # On explicit cycle: always run the engine switch.
+        # Do NOT gate on _current_layout — monocle mode leaves _current_layout
+        # unchanged, so cycling monocle→master with _current_layout=="master"
+        # would otherwise skip the switch even though the workspace still has
+        # the old dwindle engine from before the monocle.
         if force_retile:
             self._switch_ws_engine(layout)
 
@@ -498,18 +516,8 @@ class HawesomeDaemon:
         log.info("switch_ws_engine: ws=%d %s→%s (%d windows)",
                  ws_id, current_engine, layout, len(tiled))
 
-        # Find this workspace's monitor and its slot number (1–8)
-        monitors = hyprctl_json("monitors", "-j") or []
         mon_name = ws.get("monitor", "")
-        mon_index = next((i for i, m in enumerate(monitors) if m["name"] == mon_name), 0)
-        base = mon_index * 8 + 1
-        slot = ws_id - base + 1  # 1–8
-
-        # Pick an adjacent slot to switch away to temporarily
-        tmp_slot = 1 if slot != 1 else 2
-
-        # Temp workspace ID far out of range to avoid collisions
-        tmp_ws = 900 + ws_id
+        tmp_ws   = 800 + ws_id  # scratch workspace, outside any monitor's 1–24 range
 
         batch_out = " ; ".join(
             f"dispatch movetoworkspacesilent {tmp_ws},address:{a}" for a in tiled
@@ -518,17 +526,36 @@ class HawesomeDaemon:
             f"dispatch movetoworkspacesilent {ws_id},address:{a}" for a in tiled
         )
 
-        # 1. Switch monitor away so ws_id becomes destroyable
-        hyprctl("dispatch", "split-workspace", str(tmp_slot))
+        # Suppress focus-change event handling while we move workspaces around.
+        # The temp workspace switches fire focusedmon/workspace events that would
+        # call _on_focus_change and clobber general:layout mid-operation.
+        # NOTE: hyprctl calls below are blocking subprocess.run() inside asyncio.
+        # The event loop is suspended during these calls, so queued socket events
+        # accumulate in the buffer and are processed AFTER this function returns.
+        # We keep _switching=True until after the loop has had a chance to drain
+        # those queued events by yielding control with asyncio.sleep(0).
+        self._switching = True
+        try:
+            # 1. Move THIS monitor to tmp_ws so ws_id becomes non-active → destroyable.
+            hyprctl("--batch",
+                    f"dispatch focusmonitor {mon_name} ; dispatch workspace {tmp_ws}")
 
-        # 2. Move all windows out → ws_id destroyed
-        hyprctl("--batch", batch_out)
+            # 2. Move all windows out → ws_id empty → Hyprland destroys it
+            hyprctl("--batch", batch_out)
 
-        # 3. Switch back → ws_id recreated under new engine
-        hyprctl("dispatch", "split-workspace", str(slot))
+            # 3. Switch this monitor back to ws_id → Hyprland creates it fresh under
+            #    the current general:layout
+            hyprctl("--batch",
+                    f"dispatch focusmonitor {mon_name} ; dispatch workspace {ws_id}")
 
-        # 4. Move windows back → tiled under new engine
-        hyprctl("--batch", batch_in)
+            # 4. Move windows back → tiled under new engine
+            hyprctl("--batch", batch_in)
+            # tmp_ws is empty and no longer active → Hyprland auto-destroys it
+        finally:
+            # Re-sync _last_ws/_last_mon so the next real focus change is detected
+            self._last_ws  = ws_id
+            self._last_mon = mon_name
+            # _switching stays True — cleared by _clear_switching() scheduled below
 
     def _force_retile_active_ws(self) -> None:
         """Legacy: kept for compatibility, now delegates to _switch_ws_engine."""
