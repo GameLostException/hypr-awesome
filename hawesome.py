@@ -315,6 +315,28 @@ class HawesomeDaemon:
             if self._monocle_ws and not self._switching:
                 self._monocle_restore_after_close()
 
+        elif event in ("openwindow", "movewindow"):
+            # A window arrived on a workspace.  If that workspace has monocle
+            # active, stash the new arrival immediately so the single-window
+            # paradigm is preserved.
+            # openwindow payload: "address,workspacename,class,title"
+            # movewindow payload: "address,workspacename"
+            if self._monocle_ws and not self._switching:
+                parts = data.split(",")
+                if len(parts) >= 2:
+                    addr    = parts[0].strip()
+                    ws_name = parts[1].strip()
+                    # Ignore arrivals into stash workspaces (our own moves)
+                    if not ws_name.startswith("special:monocle"):
+                        try:
+                            ws_id = int(ws_name)
+                        except ValueError:
+                            ws_id = -1
+                        if ws_id in self._monocle_ws:
+                            asyncio.create_task(
+                                self._stash_new_window_async(addr, ws_id)
+                            )
+
     async def _on_focus_change(self, ws: int, mon: str) -> None:
         """Apply saved layout when WS×mon focus changes."""
         # Suppress during _switch_ws_engine — it fires temp workspace events
@@ -631,6 +653,39 @@ class HawesomeDaemon:
     def _force_retile_active_ws(self) -> None:
         """Unused legacy wrapper — kept so external tooling isn't broken."""
         pass
+
+    async def _stash_new_window_async(self, addr: str, ws_id: int) -> None:
+        """
+        Stash a window that arrived on a monocle workspace.
+
+        Called via asyncio.create_task when openwindow/movewindow fires for a
+        workspace with monocle active.  The short sleep lets Hyprland finish
+        placing the window before we move it.
+
+        Note: Hyprland event payloads omit the "0x" address prefix, but
+        hyprctl dispatch requires it.  We normalise here.
+        """
+        await asyncio.sleep(0.15)   # let Hyprland finish placing the window
+
+        # Normalise to 0x-prefixed form that hyprctl requires
+        full_addr = addr if addr.startswith("0x") else f"0x{addr}"
+
+        clients = hyprctl_json("clients", "-j") or []
+        target = next(
+            (c for c in clients if c["address"] == full_addr), None
+        )
+        if not target:
+            log.debug("stash_new_window: addr %s not found", full_addr)
+            return
+        # Confirm it's still on the monocle workspace (not already moved)
+        if target.get("workspace", {}).get("id") != ws_id:
+            return
+        # Double-check monocle is still active (user may have cycled away)
+        if ws_id not in self._monocle_ws:
+            return
+        stash = f"special:monocle{ws_id}"
+        hyprctl("dispatch", f"movetoworkspacesilent {stash},address:{full_addr}")
+        log.info("monocle: stashed new window %s on ws=%d", target.get("class"), ws_id)
 
     def _monocle_restore_after_close(self) -> None:
         """
