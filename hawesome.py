@@ -502,6 +502,12 @@ class HawesomeDaemon:
                 log.info("monocle cycle: ws=%d showed %s", ws_id, next_win.get("class"))
             return
 
+        # If active_addr is empty (e.g. after a _switch_ws_engine temp workspace
+        # hop), focus the first tiled window before stashing others.
+        if not active_addr and tiled:
+            active_addr = tiled[0]["address"]
+            hyprctl("dispatch", "focuswindow", f"address:{active_addr}")
+
         # Entering monocle: stash all non-active tiled windows
         others = [c["address"] for c in tiled if c["address"] != active_addr]
         if not others and len(tiled) <= 1:
@@ -690,6 +696,22 @@ class HawesomeDaemon:
         except Exception:
             self._current_layout = ""
         log.info("Initial focus ws=%d mon=%s layout=%r", ws, mon, self._current_layout)
+
+        # Restore any monocle stash workspaces left over from a previous session.
+        # special:monocleN workspaces persist across daemon restarts — move all
+        # stashed windows back to their original workspace so the slate is clean.
+        clients = hyprctl_json("clients", "-j") or []
+        for c in clients:
+            ws_name = c.get("workspace", {}).get("name", "")
+            if ws_name.startswith("special:monocle"):
+                try:
+                    orig_ws = int(ws_name[len("special:monocle"):])
+                    hyprctl("dispatch",
+                            f"movetoworkspacesilent {orig_ws},address:{c['address']}")
+                    log.info("seed: restored stashed window %s to ws=%d",
+                             c.get("class"), orig_ws)
+                except (ValueError, KeyError):
+                    pass
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
