@@ -254,10 +254,11 @@ class LayoutState:
 
 class HawesomeDaemon:
     def __init__(self):
-        self.state     = LayoutState()
-        self._last_ws:  int = -1
-        self._last_mon: str = ""
+        self.state            = LayoutState()
+        self._last_ws:  int   = -1
+        self._last_mon: str   = ""
         self._current_layout: str = ""   # last layout keyword sent to Hyprland
+        self._monocle_ws: set[int] = set()  # workspace IDs with monocle active
 
     # ── Hyprland event listener ──────────────────────────────────────────────
 
@@ -389,56 +390,98 @@ class HawesomeDaemon:
         """
         Apply layout for the currently focused WS×mon.
 
-        general:layout is a global Hyprland keyword — it affects all monitors.
-        We only issue it when the mode actually differs from what's already
-        set, so focusing a monitor whose layout matches the current global
-        layout does not disturb the other monitors' active windows.
+        Hyprland assigns a layout engine (dwindle or master) to each workspace
+        permanently at creation time. general:layout only affects future
+        workspaces. To change an existing workspace's engine we must:
+          1. Set general:layout to the new engine
+          2. Move all tiled windows out (workspace is destroyed when empty)
+          3. Move them back (workspace is recreated fresh with the new engine)
 
-        master:orientation is also global but is mode-specific state that
-        only matters when layout=master, so it's safe to set on every master
-        focus change.
+        Monocle is simulated via fullscreen 1 (fake fullscreen) on the active
+        window — it is not a separate engine.
 
-        force_retile=True: move all tiled windows on the active workspace to a
-        temporary special workspace and back, forcing the new layout engine to
-        re-tile them. Used when the user explicitly cycles the layout mode.
+        force_retile=True: apply the engine switch / monocle simulation.
+                           Used on explicit cycle-mode (SUP+M).
+        force_retile=False: only update general:layout for new workspaces.
+                            Used on focus change (no visual disruption).
         """
-        layout_changed = False
-
         if mode == "monocle":
-            if self._current_layout != "monocle":
-                hyprctl("keyword", "general:layout", "monocle")
-                self._current_layout = "monocle"
-                layout_changed = True
+            if force_retile:
+                self._apply_monocle()
+            # general:layout stays as whatever it was (dwindle/master)
+            return
 
-        elif mode == "dwindle":
-            if self._current_layout != "dwindle":
-                hyprctl("keyword", "general:layout", "dwindle")
-                self._current_layout = "dwindle"
-                layout_changed = True
+        # Exiting monocle — undo fullscreen if active on this workspace
+        if force_retile:
+            self._exit_monocle_if_active()
 
-        elif mode == "master":
-            if self._current_layout != "master":
-                hyprctl("keyword", "general:layout", "master")
-                self._current_layout = "master"
-                layout_changed = True
+        layout = "dwindle" if mode == "dwindle" else "master"
+        old_layout = self._current_layout
+
+        # Always keep general:layout in sync for new workspaces
+        if old_layout != layout:
+            hyprctl("keyword", "general:layout", layout)
+            self._current_layout = layout
+
+        if mode == "master":
             hyprctl("keyword", "master:orientation", variant or "left")
 
-        if force_retile and layout_changed:
-            self._force_retile_active_ws()
+        # On explicit cycle: if the active workspace's engine differs from the
+        # new mode, destroy-and-recreate it so it picks up the new engine.
+        if force_retile:
+            self._switch_ws_engine(layout)
 
-    def _force_retile_active_ws(self) -> None:
+    def _apply_monocle(self) -> None:
         """
-        Force the new layout engine to re-tile existing windows on the active
-        workspace.
-
-        Hyprland only applies general:layout to newly-opened windows. Existing
-        windows keep their old positions. This method moves all tiled windows on
-        the focused workspace to a temporary special workspace and immediately
-        back, which causes Hyprland to re-tile them under the new engine.
+        Simulate monocle by fake-fullscreening the active window.
+        Tracks which workspace has monocle active so we can undo it.
         """
         ws = hyprctl_json("activeworkspace", "-j") or {}
         ws_id = ws.get("id")
-        if not ws_id:
+        aw = hyprctl_json("activewindow", "-j") or {}
+        addr = aw.get("address", "")
+        if not addr or not ws_id:
+            return
+        # If already in monocle on this ws, cycle to next window
+        if ws_id in self._monocle_ws:
+            hyprctl("dispatch", "cyclenext")
+        else:
+            hyprctl("dispatch", "fullscreen", "1")
+            self._monocle_ws.add(ws_id)
+        log.info("monocle: ws=%d active=%s", ws_id, addr)
+
+    def _exit_monocle_if_active(self) -> None:
+        """Undo fullscreen if the active workspace has monocle simulation active."""
+        ws = hyprctl_json("activeworkspace", "-j") or {}
+        ws_id = ws.get("id")
+        if ws_id and ws_id in self._monocle_ws:
+            # Check if active window is actually fullscreened
+            aw = hyprctl_json("activewindow", "-j") or {}
+            if aw.get("fullscreen", 0):
+                hyprctl("dispatch", "fullscreen", "1")  # toggle off
+            self._monocle_ws.discard(ws_id)
+            log.info("monocle exit: ws=%d", ws_id)
+
+    def _switch_ws_engine(self, layout: str) -> None:
+        """
+        Switch the active workspace's tiling engine by destroying and recreating it.
+
+        Hyprland assigns a layout engine to a workspace permanently at creation.
+        The only way to change it is to destroy the workspace (by emptying it)
+        and recreate it under the new general:layout.
+
+        Steps:
+        1. Switch the monitor to an adjacent workspace (so the target ws can be destroyed)
+        2. Move all tiled windows to a temp workspace (target ws is now empty → destroyed)
+        3. Switch back to the target workspace (recreated fresh under new engine)
+        4. Move all windows back (they tile under the new engine)
+        """
+        ws = hyprctl_json("activeworkspace", "-j") or {}
+        ws_id  = ws.get("id")
+        current_engine = ws.get("tiledLayout", "")
+
+        if not ws_id or current_engine == layout:
+            log.info("switch_ws_engine: ws=%d already %s, skip", ws_id, layout)
             return
 
         clients = hyprctl_json("clients", "-j") or []
@@ -449,21 +492,48 @@ class HawesomeDaemon:
             and not c.get("floating")
         ]
         if not tiled:
+            log.info("switch_ws_engine: ws=%d no tiled windows, skip", ws_id)
             return
 
-        log.info("force_retile: %d windows on ws %d", len(tiled), ws_id)
+        log.info("switch_ws_engine: ws=%d %s→%s (%d windows)",
+                 ws_id, current_engine, layout, len(tiled))
 
-        # Move all out atomically, then all back atomically
+        # Find this workspace's monitor and its slot number (1–8)
+        monitors = hyprctl_json("monitors", "-j") or []
+        mon_name = ws.get("monitor", "")
+        mon_index = next((i for i, m in enumerate(monitors) if m["name"] == mon_name), 0)
+        base = mon_index * 8 + 1
+        slot = ws_id - base + 1  # 1–8
+
+        # Pick an adjacent slot to switch away to temporarily
+        tmp_slot = 1 if slot != 1 else 2
+
+        # Temp workspace ID far out of range to avoid collisions
+        tmp_ws = 900 + ws_id
+
         batch_out = " ; ".join(
-            f"dispatch movetoworkspacesilent special:retile,address:{a}"
-            for a in tiled
+            f"dispatch movetoworkspacesilent {tmp_ws},address:{a}" for a in tiled
         )
         batch_in = " ; ".join(
-            f"dispatch movetoworkspacesilent {ws_id},address:{a}"
-            for a in tiled
+            f"dispatch movetoworkspacesilent {ws_id},address:{a}" for a in tiled
         )
+
+        # 1. Switch monitor away so ws_id becomes destroyable
+        hyprctl("dispatch", "split-workspace", str(tmp_slot))
+
+        # 2. Move all windows out → ws_id destroyed
         hyprctl("--batch", batch_out)
+
+        # 3. Switch back → ws_id recreated under new engine
+        hyprctl("dispatch", "split-workspace", str(slot))
+
+        # 4. Move windows back → tiled under new engine
         hyprctl("--batch", batch_in)
+
+    def _force_retile_active_ws(self) -> None:
+        """Legacy: kept for compatibility, now delegates to _switch_ws_engine."""
+        ws = hyprctl_json("activeworkspace", "-j") or {}
+        self._switch_ws_engine(self._current_layout)
 
     def _apply_variant(self, mode: str, variant: str | None) -> None:
         """Apply only the variant change for the current mode."""
