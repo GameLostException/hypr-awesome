@@ -12,6 +12,29 @@ Each **(workspace, monitor)** combination independently remembers its own:
 Switching workspace or monitor focus automatically restores the saved layout for that combo.  
 No combo ever clobbers another.
 
+## Hyprland layout constraint
+
+Hyprland has a single global `general:layout` keyword — there is no per-monitor or
+per-workspace layout API.  hawesome works around this as follows:
+
+- **On focus change** (workspace switch or monitor focus): hawesome sets `general:layout`
+  to the incoming WS×mon's mode.  This is the only moment it matters, since Hyprland's
+  layout engine only affects **newly tiled windows** — existing window positions and splits
+  are preserved per-workspace by Hyprland natively.
+
+- **What this means in practice**: each workspace's tiling is independent.  If ws A has
+  two windows split dwindle-style and ws B has three windows in master, switching between
+  them always shows the correct arrangement.  The global layout keyword only controls
+  which engine tiles the *next* window you open.  hawesome keeps it in sync with the
+  focused WS×mon so that window is always tiled correctly.
+
+- **The one real limitation**: two monitors cannot simultaneously use *different* tiling
+  engines for newly-opened windows.  If eDP-1 is in master mode and you open a window on
+  DP-5 (dwindle), the window on DP-5 will be tiled with master until focus returns to
+  DP-5.  This is an inherent Hyprland constraint, not a hawesome bug.  In practice it
+  is rarely noticeable because `general:layout` is always set correctly for the focused
+  monitor — the monitor you are actually working on.
+
 ## Layout modes
 
 | Mode | Description | Variants (SUP+SHIFT+M) |

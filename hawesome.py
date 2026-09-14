@@ -349,8 +349,8 @@ class HawesomeDaemon:
             mode    = s["mode"]
             variant = self.state.current_variant(ws, mon)
             log.info("cycle-mode → ws=%d mon=%s → %s/%s", ws, mon, mode, variant or "—")
-            self._apply(mode, variant)
-            self._notify_waybar()
+            self._apply(mode, variant, force_retile=True)
+            self._notify_wayapps()
             asyncio.get_running_loop().call_soon(self.state.save)
             return self.state.to_json(ws, mon)
 
@@ -361,7 +361,7 @@ class HawesomeDaemon:
             if changed:
                 log.info("cycle-variant → ws=%d mon=%s → %s/%s", ws, mon, mode, variant)
                 self._apply_variant(mode, variant)
-                self._notify_waybar()
+                self._notify_wayapps()
                 asyncio.get_running_loop().call_soon(self.state.save)
             else:
                 log.info("cycle-variant → no variants for mode=%s", mode)
@@ -385,7 +385,7 @@ class HawesomeDaemon:
 
     # ── Layout application helpers ───────────────────────────────────────────
 
-    def _apply(self, mode: str, variant: str | None) -> None:
+    def _apply(self, mode: str, variant: str | None, force_retile: bool = False) -> None:
         """
         Apply layout for the currently focused WS×mon.
 
@@ -397,22 +397,73 @@ class HawesomeDaemon:
         master:orientation is also global but is mode-specific state that
         only matters when layout=master, so it's safe to set on every master
         focus change.
+
+        force_retile=True: move all tiled windows on the active workspace to a
+        temporary special workspace and back, forcing the new layout engine to
+        re-tile them. Used when the user explicitly cycles the layout mode.
         """
+        layout_changed = False
+
         if mode == "monocle":
             if self._current_layout != "monocle":
                 hyprctl("keyword", "general:layout", "monocle")
                 self._current_layout = "monocle"
+                layout_changed = True
 
         elif mode == "dwindle":
             if self._current_layout != "dwindle":
                 hyprctl("keyword", "general:layout", "dwindle")
                 self._current_layout = "dwindle"
+                layout_changed = True
 
         elif mode == "master":
             if self._current_layout != "master":
                 hyprctl("keyword", "general:layout", "master")
                 self._current_layout = "master"
+                layout_changed = True
             hyprctl("keyword", "master:orientation", variant or "left")
+
+        if force_retile and layout_changed:
+            self._force_retile_active_ws()
+
+    def _force_retile_active_ws(self) -> None:
+        """
+        Force the new layout engine to re-tile existing windows on the active
+        workspace.
+
+        Hyprland only applies general:layout to newly-opened windows. Existing
+        windows keep their old positions. This method moves all tiled windows on
+        the focused workspace to a temporary special workspace and immediately
+        back, which causes Hyprland to re-tile them under the new engine.
+        """
+        ws = hyprctl_json("activeworkspace", "-j") or {}
+        ws_id = ws.get("id")
+        if not ws_id:
+            return
+
+        clients = hyprctl_json("clients", "-j") or []
+        tiled = [
+            c["address"] for c in clients
+            if c.get("workspace", {}).get("id") == ws_id
+            and not c.get("hidden")
+            and not c.get("floating")
+        ]
+        if not tiled:
+            return
+
+        log.info("force_retile: %d windows on ws %d", len(tiled), ws_id)
+
+        # Move all out atomically, then all back atomically
+        batch_out = " ; ".join(
+            f"dispatch movetoworkspacesilent special:retile,address:{a}"
+            for a in tiled
+        )
+        batch_in = " ; ".join(
+            f"dispatch movetoworkspacesilent {ws_id},address:{a}"
+            for a in tiled
+        )
+        hyprctl("--batch", batch_out)
+        hyprctl("--batch", batch_in)
 
     def _apply_variant(self, mode: str, variant: str | None) -> None:
         """Apply only the variant change for the current mode."""
@@ -423,8 +474,10 @@ class HawesomeDaemon:
         # monocle: noop
         # _current_layout unchanged — variant changes don't switch the layout
 
-    def _notify_waybar(self) -> None:
-        """Signal waybar to refresh custom modules (RTMIN+8)."""
+    def _notify_wayapps(self) -> None:
+        """Signal all wayapps instances to refresh their layout icon (SIGUSR1)."""
+        subprocess.run(["pkill", "-SIGUSR1", "-f", "wayapps.py"], capture_output=True)
+        # Also signal waybar for any custom layout modules
         subprocess.run(["pkill", "-RTMIN+8", "waybar"], capture_output=True)
 
     # ── Entry point ──────────────────────────────────────────────────────────
