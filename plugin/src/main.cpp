@@ -106,6 +106,30 @@ void applyStateToWorkspace(PHLWORKSPACE ws, bool recalc = true) {
 // ---------------------------------------------------------------------------
 
 static CHyprSignalListener g_workspaceCreatedHook;
+static CHyprSignalListener g_windowOpenHook;
+
+// When a window opens on a monocle workspace, focus it immediately so it
+// appears in front. CMonocleAlgorithm uses focus to determine the visible
+// window — focusing the new arrival brings it to the top of the stack.
+static void onWindowOpen(PHLWINDOW win) {
+    if (!win || !win->m_isMapped) return;
+    if (win->m_isFloating) return;       // don't interfere with floating windows
+
+    auto ws = win->m_workspace;
+    if (!isManagedWorkspace(ws)) return;
+
+    int         wsId = ws->m_id;
+    std::string mon  = ws->m_monitor ? ws->m_monitor->m_name : "";
+
+    const SHAState* s = g_state.peek(wsId, mon);
+    if (!s || s->mode != HA::MONOCLE) return;
+
+    // Focus the new window — CMonocleAlgorithm.focusTargetUpdate() runs and
+    // makes this window the visible one, pushing others behind it.
+    Desktop::focusState()->fullWindowFocus(win, Desktop::FOCUS_REASON_NEW_WINDOW);
+    Log::logger->log(Log::INFO, "[hawesome] monocle: focused new window {} on ws={}",
+                     win->m_class, wsId);
+}
 
 // ---------------------------------------------------------------------------
 // Notify wayapps to refresh layout icon
@@ -280,14 +304,17 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(PHANDLE, "hawesome:focus-window",  ::dispatchFocusWindow);
 
     // Hook workspace creation to assign saved layout.
-    // Do NOT apply to all existing workspaces at init — that would disrupt
-    // running windows and fire setAlgorithmProvider on copyq/popup workspaces.
     g_workspaceCreatedHook = Event::bus()->m_events.workspace.created.listen(
         [](PHLWORKSPACEREF wsRef) {
             auto ws = wsRef.lock();
             if (!ws || !isManagedWorkspace(ws)) return;
-            // New workspace: apply saved layout if any, else default (dwindle)
             applyStateToWorkspace(ws, false);
+        });
+
+    // Hook window open: focus new arrivals on monocle workspaces immediately.
+    g_windowOpenHook = Event::bus()->m_events.window.open.listen(
+        [](PHLWINDOW win) {
+            onWindowOpen(win);
         });
 
     Log::logger->log(Log::INFO, "[hawesome] Plugin initialised");
