@@ -266,6 +266,7 @@ class HawesomeDaemon:
         self._current_layout: str  = ""        # last layout keyword sent to Hyprland
         self._monocle_ws: set[int] = set()     # workspace IDs with monocle active
         self._switching: bool = False           # True while _switch_ws_engine runs
+        self._monocle_swap_ws: set[int] = set() # ws IDs mid-swap (suppress stash)
 
     # ── Hyprland event listener ──────────────────────────────────────────────
 
@@ -332,7 +333,8 @@ class HawesomeDaemon:
                             ws_id = int(ws_name)
                         except ValueError:
                             ws_id = -1
-                        if ws_id in self._monocle_ws:
+                        if ws_id in self._monocle_ws \
+                                and ws_id not in self._monocle_swap_ws:
                             asyncio.create_task(
                                 self._stash_new_window_async(addr, ws_id)
                             )
@@ -423,6 +425,21 @@ class HawesomeDaemon:
 
         elif cmd == "dump":
             return self.state.dump_json()
+
+        elif cmd.startswith("monocle-swap-begin:"):
+            # Called by wayapps monocle_swap() before performing a cycle swap.
+            # Suppresses _stash_new_window_async for this workspace for 500ms
+            # so the movewindow event from the swap is not treated as a new arrival.
+            try:
+                ws_id = int(cmd[len("monocle-swap-begin:"):])
+            except ValueError:
+                return json.dumps({"error": "invalid ws_id"})
+            self._monocle_swap_ws.add(ws_id)
+            asyncio.get_running_loop().call_later(
+                0.5, self._monocle_swap_ws.discard, ws_id
+            )
+            log.debug("monocle-swap-begin: ws=%d suppressed for 500ms", ws_id)
+            return json.dumps({"ok": True})
 
         else:
             return json.dumps({"error": f"unknown command: {cmd}"})
