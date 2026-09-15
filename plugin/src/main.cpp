@@ -34,59 +34,68 @@ inline HANDLE       PHANDLE = nullptr;
 inline CLayoutState g_state;
 
 // ---------------------------------------------------------------------------
-// Algorithm factory
+// Algorithm factory helpers
 // ---------------------------------------------------------------------------
 
-static SP<Layout::CAlgorithm> makeAlgorithm(eHAMode mode, const SHAState& s,
-                                             SP<Layout::CSpace> space) {
-    using namespace Layout;
+static UP<Layout::ITiledAlgorithm> makeTiledAlgorithm(eHAMode mode) {
     using namespace Layout::Tiled;
-    using namespace Layout::Floating;
-
-    UP<ITiledAlgorithm>    tiled;
-    UP<IFloatingAlgorithm> floating = makeUnique<CDefaultFloatingAlgorithm>();
-
     switch (mode) {
-        case eHAMode::MONOCLE:
-            tiled = makeUnique<CMonocleAlgorithm>();
-            break;
-        case eHAMode::MASTER:
-            tiled = makeUnique<CMasterAlgorithm>();
-            break;
-        case eHAMode::DWINDLE:
-        default:
-            tiled = makeUnique<CDwindleAlgorithm>();
-            break;
+        case HA::MONOCLE: return makeUnique<CMonocleAlgorithm>();
+        case HA::MASTER:  return makeUnique<CMasterAlgorithm>();
+        case HA::DWINDLE:
+        default:          return makeUnique<CDwindleAlgorithm>();
     }
+}
 
-    return CAlgorithm::create(std::move(tiled), std::move(floating), space);
+static SP<Layout::CAlgorithm> makeAlgorithm(eHAMode mode, SP<Layout::CSpace> space) {
+    using namespace Layout::Floating;
+    return Layout::CAlgorithm::create(
+        makeTiledAlgorithm(mode),
+        makeUnique<CDefaultFloatingAlgorithm>(),
+        space);
 }
 
 // ---------------------------------------------------------------------------
 // Apply state to a workspace
 // ---------------------------------------------------------------------------
 
+// Returns true if this workspace should be managed by hawesome.
+static bool isManagedWorkspace(PHLWORKSPACE ws) {
+    if (!ws || !ws->m_space)    return false;
+    if (ws->m_isSpecialWorkspace) return false;
+    if (ws->inert())            return false;
+    if (ws->m_id <= 0)          return false;
+    if (ws->m_id >= 800)        return false; // temp workspaces used by old daemon
+    return true;
+}
+
 void applyStateToWorkspace(PHLWORKSPACE ws, bool recalc = true) {
-    if (!ws || !ws->m_space) return;
+    if (!isManagedWorkspace(ws)) return;
 
-    int wsId = ws->m_id;
-    if (wsId <= 0) return;  // special/invalid workspace
+    int         wsId = ws->m_id;
+    std::string mon  = ws->m_monitor ? ws->m_monitor->m_name : "";
 
-    std::string mon = ws->m_monitor ? ws->m_monitor->m_name : "";
+    const SHAState& s = g_state.get(wsId, mon);
 
-    const SHAState& s    = g_state.get(wsId, mon);
-    auto            algo = makeAlgorithm(s.mode, s, ws->m_space);
-    ws->m_space->setAlgorithmProvider(algo);
+    if (ws->m_space->algorithm()) {
+        // Workspace already has windows registered in the algorithm.
+        // Use updateTiledAlgo to swap just the tiling engine — this keeps
+        // all existing ITarget registrations and triggers a proper re-tile.
+        auto newTiled = makeTiledAlgorithm(s.mode);
+        ws->m_space->algorithm()->updateTiledAlgo(std::move(newTiled));
+    } else {
+        // Fresh workspace — set full algorithm provider
+        ws->m_space->setAlgorithmProvider(makeAlgorithm(s.mode, ws->m_space));
+    }
 
-    // Apply master orientation after algorithm is set
-    if (s.mode == eHAMode::MASTER) {
+    if (s.mode == HA::MASTER) {
         std::string orient = CLayoutState::variantName(s);
         if (!orient.empty())
             (void)ws->m_space->layoutMsg("orientation" + orient);
     }
 
     if (recalc)
-        ws->m_space->recalculate(Layout::RECALCULATE_REASON_UNKNOWN);
+        ws->m_space->recalculate(Layout::RECALCULATE_REASON_WORKSPACE_CHANGE);
 
     Log::logger->log(Log::DEBUG, "[hawesome] Applied {} to ws={} mon={}",
                      CLayoutState::modeName(s.mode), wsId, mon);
@@ -97,13 +106,6 @@ void applyStateToWorkspace(PHLWORKSPACE ws, bool recalc = true) {
 // ---------------------------------------------------------------------------
 
 static CHyprSignalListener g_workspaceCreatedHook;
-
-// Called when a workspace is created — assign its initial algorithm
-static void onWorkspaceCreated(PHLWORKSPACEREF wsRef) {
-    auto ws = wsRef.lock();
-    if (!ws || ws->m_isSpecialWorkspace) return;
-    applyStateToWorkspace(ws, false);
-}
 
 // ---------------------------------------------------------------------------
 // Notify wayapps to refresh layout icon
@@ -134,11 +136,21 @@ static SDispatchResult dispatchCycleMode(std::string args) {
 
     int         wsId = ws->m_id;
     std::string mon  = ws->m_monitor ? ws->m_monitor->m_name : "";
+
+    Log::logger->log(Log::INFO, "[hawesome] cycle-mode called: ws={} mon={}", wsId, mon);
+
     eHAMode     mode = g_state.cycleMode(wsId, mon);
     const auto& s    = g_state.get(wsId, mon);
 
-    auto algo = makeAlgorithm(mode, s, ws->m_space);
-    ws->m_space->setAlgorithmProvider(algo);
+    Log::logger->log(Log::INFO, "[hawesome] cycle-mode new mode={} ({})",
+                     static_cast<int>(mode), CLayoutState::modeName(mode));
+
+    auto algo = makeAlgorithm(mode, ws->m_space);
+    if (ws->m_space->algorithm()) {
+        ws->m_space->algorithm()->updateTiledAlgo(makeTiledAlgorithm(mode));
+    } else {
+        ws->m_space->setAlgorithmProvider(algo);
+    }
 
     if (mode == eHAMode::MASTER) {
         std::string orient = CLayoutState::variantName(s);
@@ -146,7 +158,7 @@ static SDispatchResult dispatchCycleMode(std::string args) {
             (void)ws->m_space->layoutMsg("orientation" + orient);
     }
 
-    ws->m_space->recalculate(Layout::RECALCULATE_REASON_UNKNOWN);
+    ws->m_space->recalculate(Layout::RECALCULATE_REASON_WORKSPACE_CHANGE);
     g_state.save();
     notifyWayapps();
 
@@ -267,17 +279,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(PHANDLE, "hawesome:status",        ::dispatchStatus);
     HyprlandAPI::addDispatcherV2(PHANDLE, "hawesome:focus-window",  ::dispatchFocusWindow);
 
-    // Hook workspace creation to assign saved layout
+    // Hook workspace creation to assign saved layout.
+    // Do NOT apply to all existing workspaces at init — that would disrupt
+    // running windows and fire setAlgorithmProvider on copyq/popup workspaces.
     g_workspaceCreatedHook = Event::bus()->m_events.workspace.created.listen(
         [](PHLWORKSPACEREF wsRef) {
-            onWorkspaceCreated(wsRef);
+            auto ws = wsRef.lock();
+            if (!ws || !isManagedWorkspace(ws)) return;
+            // New workspace: apply saved layout if any, else default (dwindle)
+            applyStateToWorkspace(ws, false);
         });
-
-    // Apply saved state to all currently active workspaces
-    for (auto& mon : State::monitorState()->monitors()) {
-        if (mon->m_activeWorkspace)
-            applyStateToWorkspace(mon->m_activeWorkspace, true);
-    }
 
     Log::logger->log(Log::INFO, "[hawesome] Plugin initialised");
     HyprlandAPI::addNotification(PHANDLE, "[hawesome] Loaded",
