@@ -83,14 +83,22 @@ std::string CLayoutState::variantName(const SHAState& s) {
         case eHAMode::MONOCLE:
             return "";
         case eHAMode::MASTER:
-            switch (s.masterOrientation) {
-                case eHAMasterVariant::LEFT:   return "left";
-                case eHAMasterVariant::TOP:    return "top";
-                case eHAMasterVariant::RIGHT:  return "right";
-                case eHAMasterVariant::BOTTOM: return "bottom";
-            }
+            return masterOrientName(s.masterOrientation);
     }
     return "";
+}
+
+// Returns the orientation string for a master variant, independent of current mode.
+// Used in save() so the masterOrientation field is always a valid orientation name
+// (never "h" or "v" from the dwindle variant).
+std::string CLayoutState::masterOrientName(eHAMasterVariant v) {
+    switch (v) {
+        case eHAMasterVariant::TOP:    return "top";
+        case eHAMasterVariant::RIGHT:  return "right";
+        case eHAMasterVariant::BOTTOM: return "bottom";
+        case eHAMasterVariant::LEFT:
+        default:                       return "left";
+    }
 }
 
 std::string CLayoutState::toJson(int wsId, const std::string& monitor) const {
@@ -260,7 +268,7 @@ void CLayoutState::save() const {
         o << "  \"" << key.first << "@" << key.second << "\": {\n"
           << "    \"mode\": \"" << CLayoutState::modeName(s.mode) << "\",\n"
           << "    \"dwindleVertical\": " << (s.dwindleVertical ? "true" : "false") << ",\n"
-          << "    \"masterOrientation\": \"" << CLayoutState::variantName(s) << "\"\n"
+          << "    \"masterOrientation\": \"" << CLayoutState::masterOrientName(s.masterOrientation) << "\"\n"
           << "  }";
     }
     o << "\n}\n";

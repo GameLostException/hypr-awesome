@@ -66,6 +66,7 @@ class CLayoutState {
 
     static std::string modeName(eHAMode m);
     static std::string variantName(const SHAState& s);
+    static std::string masterOrientName(eHAMasterVariant v);
 
   private:
     std::map<std::pair<int, std::string>, SHAState> m_state;
