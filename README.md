@@ -58,23 +58,32 @@ Focus events fired during this operation are suppressed via `_switching` flag + 
 ## Architecture
 
 ```
-hawesome.py        daemon — asyncio IPC listener + control socket server
-hawesome-ctl.py    CLI — sends commands to daemon (called by keybinds)
+plugin/src/main.cpp       Hyprland plugin — registers dispatchers, hooks workspace/monitor events
+plugin/src/LayoutState.cpp State management — slot-keyed persistence, monitor lifecycle
+hawesome-ctl.py           CLI — queries the plugin's Unix socket (status, dump)
+hawesome.py               Legacy Python daemon — REPLACED by plugin, kept for reference only
 ```
 
-State is persisted to `~/.config/hypr-awesome/state.json` as `slot@monitor` keys.  
-Control socket: `/tmp/hawesome-{uid}.sock`
+State is persisted to `~/.config/hypr-awesome/state.json` as `slot@monitor` keys
+(e.g. `"1@DP-5"` — stable across monitor index changes).
+Control socket: `/tmp/hawesome-{uid}.sock` (provided by the plugin, not the daemon).
 
 ## Install
 
 ```bash
-cd ~/Lab/hypr-awesome
-bash install.sh
+cd ~/Lab/hypr-awesome/plugin/src
+make -j$(nproc)
 ```
 
 Add to `hyprland.conf`:
 ```ini
-exec-once = python3 ~/Lab/hypr-awesome/hawesome.py
+exec-once = hyprctl plugin load ~/Lab/hypr-awesome/plugin/build/hawesome.so
+```
+
+Or manage via hyprpm (recommended — survives Hyprland updates):
+```bash
+hyprpm add https://github.com/...
+hyprpm enable hawesome
 ```
 
 ## Control socket commands

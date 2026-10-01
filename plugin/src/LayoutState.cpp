@@ -1,6 +1,9 @@
 #include "LayoutState.hpp"
 
 #include <hyprland/src/debug/log/Logger.hpp>
+#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
 
 #include <fstream>
 #include <sstream>
@@ -10,15 +13,6 @@
 // ---------------------------------------------------------------------------
 // Minimal JSON helpers (no external deps)
 // ---------------------------------------------------------------------------
-
-static std::string jsonStr(const std::string& s) {
-    return "\"" + s + "\"";
-}
-
-// Very small JSON parser for our state file.
-// Format: { "slot@monitor": { "mode": "dwindle", "dwindleVertical": false,
-//                             "masterOrientation": "left" }, ... }
-// We keep it simple — no nested objects beyond one level.
 
 static std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n\"");
@@ -31,13 +25,17 @@ static std::string trim(const std::string& s) {
 // ---------------------------------------------------------------------------
 
 CLayoutState::CLayoutState() {
-    load();
+    // load() is called explicitly from PLUGIN_INIT after the plugin handle is
+    // set up, so we don't call it here.
 }
 
 SHAState& CLayoutState::get(int wsId, const std::string& monitor) {
     auto key = std::make_pair(wsId, monitor);
-    if (m_state.find(key) == m_state.end())
-        m_state[key] = SHAState{};
+    if (m_state.find(key) == m_state.end()) {
+        // Try to restore from saved slot-keyed state
+        auto saved = _savedFor(wsId, monitor);
+        m_state[key] = saved ? *saved : SHAState{};
+    }
     return m_state[key];
 }
 
@@ -88,9 +86,6 @@ std::string CLayoutState::variantName(const SHAState& s) {
     return "";
 }
 
-// Returns the orientation string for a master variant, independent of current mode.
-// Used in save() so the masterOrientation field is always a valid orientation name
-// (never "h" or "v" from the dwindle variant).
 std::string CLayoutState::masterOrientName(eHAMasterVariant v) {
     switch (v) {
         case eHAMasterVariant::TOP:    return "top";
@@ -120,6 +115,60 @@ std::string CLayoutState::toJson(int wsId, const std::string& monitor) const {
 }
 
 // ---------------------------------------------------------------------------
+// Slot resolution helpers
+//
+// split-monitor-workspaces assigns ws IDs as:
+//   monitor index i → ws (i*WS_PER_MON + 1) … (i*WS_PER_MON + WS_PER_MON)
+//
+// The "slot" (1–WS_PER_MON) is the workspace's position within its monitor.
+// We save state as "slot@monitor" so state survives monitor index changes:
+// if DP-5 moves from index 1 (ws 9) to index 0 (ws 1) after eDP-1 is removed,
+// the key "1@DP-5" still resolves correctly.
+// ---------------------------------------------------------------------------
+
+int CLayoutState::wsPerMonitor() {
+    // Read from workspaces.conf at runtime so it stays in sync with config.
+    static int cached = 0;
+    if (cached > 0) return cached;
+    const char* home = std::getenv("HOME");
+    if (!home) return 8;
+    std::string path = std::string(home) + "/.config/hypr/workspaces.conf";
+    std::ifstream f(path);
+    if (!f.is_open()) return 8;
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t p = line.find("count");
+        if (p == std::string::npos) continue;
+        size_t eq = line.find('=', p);
+        if (eq == std::string::npos) continue;
+        try {
+            cached = std::stoi(line.substr(eq + 1));
+            return cached;
+        } catch (...) {}
+    }
+    return 8;
+}
+
+// Convert a ws_id to its slot number (1-based within monitor).
+int CLayoutState::wsIdToSlot(int wsId) {
+    int n = wsPerMonitor();
+    return ((wsId - 1) % n) + 1;
+}
+
+// Build the save key: "slot@monitor"
+std::string CLayoutState::saveKey(int wsId, const std::string& monitor) {
+    return std::to_string(wsIdToSlot(wsId)) + "@" + monitor;
+}
+
+// Look up saved state for a ws_id/monitor pair using slot-keyed lookup.
+// Returns nullptr if not found in m_saved.
+const SHAState* CLayoutState::_savedFor(int wsId, const std::string& monitor) const {
+    std::string key = saveKey(wsId, monitor);
+    auto it = m_saved.find(key);
+    return (it != m_saved.end()) ? &it->second : nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 
@@ -143,18 +192,15 @@ static eHAMasterVariant orientFromString(const std::string& s) {
 }
 
 // Tiny hand-rolled JSON parser sufficient for our format.
-// Extracts top-level key→object pairs.
 static std::map<std::string, std::map<std::string, std::string>>
 parseJson(const std::string& text) {
     std::map<std::string, std::map<std::string, std::string>> result;
-    // strip outer {}
     size_t start = text.find('{');
     size_t end   = text.rfind('}');
     if (start == std::string::npos || end == std::string::npos) return result;
 
     size_t pos = start + 1;
     while (pos < end) {
-        // find key
         size_t ks = text.find('"', pos);
         if (ks == std::string::npos || ks >= end) break;
         size_t ke = text.find('"', ks + 1);
@@ -162,7 +208,6 @@ parseJson(const std::string& text) {
         std::string key = text.substr(ks + 1, ke - ks - 1);
         pos = ke + 1;
 
-        // find inner object
         size_t os = text.find('{', pos);
         if (os == std::string::npos || os >= end) break;
         size_t oe = text.find('}', os + 1);
@@ -171,7 +216,6 @@ parseJson(const std::string& text) {
         std::string inner = text.substr(os + 1, oe - os - 1);
         pos = oe + 1;
 
-        // parse inner key:value pairs
         std::map<std::string, std::string> fields;
         size_t ip = 0;
         while (ip < inner.size()) {
@@ -184,7 +228,6 @@ parseJson(const std::string& text) {
             size_t col = inner.find(':', ip);
             if (col == std::string::npos) break;
             ip = col + 1;
-            // value: could be "string" or true/false
             while (ip < inner.size() && (inner[ip] == ' ' || inner[ip] == '\t')) ip++;
             std::string fval;
             if (ip < inner.size() && inner[ip] == '"') {
@@ -213,23 +256,26 @@ void CLayoutState::load() {
                       std::istreambuf_iterator<char>());
     f.close();
 
-    // State file keys are "slot@monitor" (e.g. "3@DP-5").
-    // We store by (ws_id, monitor) at runtime but load by slot name.
-    // For now, accept both numeric ws_id keys and slot@monitor keys.
-    // Slot→ws_id mapping happens lazily when first accessed.
-    // Store in a pending map; apply when workspace is first used.
-    // For simplicity, load numeric ws_id keys directly.
     auto parsed = parseJson(text);
+    m_saved.clear();
+
     for (auto& [key, fields] : parsed) {
-        // key format: "slot@monitor" or "ws_id@monitor"
+        // Keys are "slot@monitor" (e.g. "1@DP-5") — slot is always 1-based
+        // within the monitor, independent of monitor index.
         size_t at = key.rfind('@');
         if (at == std::string::npos) continue;
         std::string slotStr = key.substr(0, at);
         std::string mon     = key.substr(at + 1);
 
-        int wsId = 0;
-        try { wsId = std::stoi(slotStr); } catch (...) { continue; }
-        if (wsId <= 0) continue;
+        // Accept both slot-style ("1@DP-5") and old ws_id-style ("9@DP-5").
+        // Both are stored in m_saved keyed as-is; _savedFor() normalises via
+        // saveKey() which produces slot-style, so old-format keys starting at
+        // 9+ will not be found — they'll fall back to defaults. This is fine:
+        // one-time migration cost of losing preferences for the first session.
+        // New saves always write slot-style so this path disappears quickly.
+        int slotOrId = 0;
+        try { slotOrId = std::stoi(slotStr); } catch (...) { continue; }
+        if (slotOrId <= 0) continue;
 
         SHAState s;
         auto it = fields.find("mode");
@@ -241,31 +287,35 @@ void CLayoutState::load() {
         it = fields.find("masterOrientation");
         if (it != fields.end()) s.masterOrientation = orientFromString(it->second);
 
-        m_state[{wsId, mon}] = s;
+        m_saved[key] = s;
     }
 
     Log::logger->log(Log::INFO, "[hawesome] Loaded {} state entries from {}",
-                     m_state.size(), statePath());
+                     m_saved.size(), statePath());
 }
 
 void CLayoutState::save() const {
-    // Create directory if needed
+    // Create directory if needed — use std::filesystem in C++17 or fallback
     std::string path = statePath();
     size_t slash = path.rfind('/');
     if (slash != std::string::npos) {
         std::string dir = path.substr(0, slash);
-        system(("mkdir -p " + dir).c_str());
+        // mkdir -p via system() is acceptable here (called infrequently, not on hot path)
+        ::system(("mkdir -p " + dir).c_str());
     }
 
     std::ostringstream o;
     o << "{\n";
     bool first = true;
+
+    // Save using slot@monitor keys — stable across monitor index changes.
     for (auto& [key, s] : m_state) {
         if (!first) o << ",\n";
         first = false;
-        // Use ws_id@monitor as key — matches Python daemon format for slots
-        // (slot == ws_id for split-monitor-workspaces where names == IDs)
-        o << "  \"" << key.first << "@" << key.second << "\": {\n"
+        // key.first = ws_id, key.second = monitor name
+        // Convert ws_id to slot for stable key
+        int slot = wsIdToSlot(key.first);
+        o << "  \"" << slot << "@" << key.second << "\": {\n"
           << "    \"mode\": \"" << CLayoutState::modeName(s.mode) << "\",\n"
           << "    \"dwindleVertical\": " << (s.dwindleVertical ? "true" : "false") << ",\n"
           << "    \"masterOrientation\": \"" << CLayoutState::masterOrientName(s.masterOrientation) << "\"\n"
@@ -276,6 +326,36 @@ void CLayoutState::save() const {
     std::ofstream f(path);
     if (f.is_open()) {
         f << o.str();
-        Log::logger->log(Log::DEBUG, "[hawesome] Saved {} state entries", m_state.size());
+        Log::logger->log(Log::DEBUG, "[hawesome] Saved {} state entries (slot-keyed)",
+                         m_state.size());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Monitor change handling
+// ---------------------------------------------------------------------------
+
+void CLayoutState::onMonitorAdded(const std::string& monitorName) {
+    // Nothing to do in state — new workspaces will trigger workspace.created
+    // events and get() will lazily restore from m_saved using the slot key.
+    Log::logger->log(Log::INFO,
+        "[hawesome] monitor added: {} — state will be restored lazily on ws creation",
+        monitorName);
+}
+
+void CLayoutState::onMonitorRemoved(const std::string& monitorName) {
+    // Remove all runtime state entries for this monitor. Their workspaces are
+    // going inert. We do NOT remove m_saved entries — the user's preferences
+    // for that monitor's slots should survive an unplug/replug cycle.
+    std::vector<std::pair<int,std::string>> toRemove;
+    for (auto& [key, _] : m_state) {
+        if (key.second == monitorName)
+            toRemove.push_back(key);
+    }
+    for (auto& k : toRemove)
+        m_state.erase(k);
+
+    Log::logger->log(Log::INFO,
+        "[hawesome] monitor removed: {} — cleared {} runtime state entries (saved preserved)",
+        monitorName, toRemove.size());
 }
