@@ -134,7 +134,7 @@ Add the following to `~/.config/hypr/hyprland.conf`:
 
 ```ini
 # split-monitor-workspaces first — establishes per-monitor workspace ID ranges
-exec-once = hyprctl plugin load /var/cache/hyprpm/boris/split-monitor-workspaces/split-monitor-workspaces.so
+exec-once = hyprctl plugin load /var/cache/hyprpm/YOUR_USER/split-monitor-workspaces/split-monitor-workspaces.so
 
 # hawesome second — seeds layout state after workspace ranges are set
 exec-once = hyprctl plugin load /home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so
@@ -173,7 +173,7 @@ bind = $mod SHIFT, m, exec, hyprctl dispatch hawesome:cycle-variant
 
 source = ~/.config/hypr/workspaces.conf   # split-monitor-workspaces config
 
-exec-once = hyprctl plugin load /var/cache/hyprpm/boris/split-monitor-workspaces/split-monitor-workspaces.so
+exec-once = hyprctl plugin load /var/cache/hyprpm/YOUR_USER/split-monitor-workspaces/split-monitor-workspaces.so
 exec-once = hyprctl plugin load /home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so
 
 $mod = SUPER
