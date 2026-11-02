@@ -54,21 +54,22 @@ State is saved to `~/.config/hypr-awesome/state.json` and restored on restart.
 
 ### Hyprland headers
 
-The plugin compiles against Hyprland's own headers. Install them via hyprpm or from source:
+The plugin compiles against Hyprland's own headers. You need the development package for your distro:
 
 ```bash
-# If you use hyprpm (recommended):
-hyprpm update
-
-# If you built Hyprland from source, headers are already present at the build path.
-# The Makefile uses pkg-config to find them automatically.
+# Arch Linux (AUR)
+yay -S hyprland-devel
+# or:
+paru -S hyprland-devel
 ```
 
-Verify headers are available:
+Verify the headers are found:
 ```bash
 pkg-config --cflags hyprland
+# should print something like: -I/usr/include/hyprland ...
 ```
-If this fails with "package not found", install `hyprland-devel` (Fedora) or `hyprland-headers` (AUR) for your distro.
+
+If `pkg-config` can't find the `hyprland` package, the headers aren't installed — the build will fail with "package hyprland was not found".
 
 ### split-monitor-workspaces (required for multi-monitor; optional for single-monitor)
 
