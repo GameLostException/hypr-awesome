@@ -494,7 +494,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor{0.2, 0.8, 0.4, 1.0}, 3000);
 
     return {"hawesome", "Per-workspace × per-monitor tiling layout",
-            "boris", "0.3.0"};
+            "boris", "0.3.1"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
