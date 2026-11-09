@@ -4,8 +4,8 @@ Per-workspace × per-monitor tiling layout plugin for Hyprland.
 Inspired by AwesomeWM's per-tag layout model — each workspace on each monitor independently remembers its own layout mode and variant.
 
 ```
-WS 1  → dwindle/h   WS 2  → master/left   WS 3  → monocle
-WS 1  → master/top  WS 4  → dwindle/v     ← different monitor, different state
+WS 1  → dwindle     WS 2  → master/left   WS 3  → monocle
+WS 1  → master/top  WS 4  → dwindle       ← different monitor, different state
 ```
 
 Switching workspace or monitor focus instantly restores the saved layout — no manual re-applying.
@@ -26,7 +26,7 @@ Switching workspace or monitor focus instantly restores the saved layout — no 
 
 | Mode | Variants (cycle with `SUPER+SHIFT+M`) |
 |------|---------------------------------------|
-| `dwindle` | `h` — split horizontally ↔ `v` — split vertically |
+| `dwindle` | none saved — `SUPER+SHIFT+M` toggles the focused split (`togglesplit`) |
 | `monocle` | none |
 | `master` | `left` → `top` → `right` → `bottom` (master window position) |
 
@@ -47,7 +47,7 @@ State is saved to `~/.config/hypr-awesome/state.json` and restored on restart.
 
 | Requirement | Notes |
 |-------------|-------|
-| [Hyprland](https://hyprland.org/) | Any recent release |
+| [Hyprland](https://hyprland.org/) | 0.57 or later (the plugin is built against its internal headers) |
 | C++23 compiler (`g++` or `clang++`) | For building the plugin |
 | `pkg-config` | For build flags resolution |
 | Hyprland development headers | See below |
@@ -218,8 +218,6 @@ Monocle works without wayapps — you can still use `ALT+TAB` or `SUPER+TAB` to 
 python3 ~/.config/hypr/hawesome-ctl.py status           # JSON: current WS×mon state
 python3 ~/.config/hypr/hawesome-ctl.py status:eDP-1     # JSON: named monitor's active WS
 python3 ~/.config/hypr/hawesome-ctl.py dump             # JSON: full persisted state
-python3 ~/.config/hypr/hawesome-ctl.py cycle-mode       # same as SUPER+M
-python3 ~/.config/hypr/hawesome-ctl.py cycle-variant    # same as SUPER+SHIFT+M
 ```
 
 Example status output:
@@ -261,4 +259,4 @@ State is saved as `slot@monitor` keys (e.g. `"3@DP-5"`). "Slot" is the 1-based p
 
 - `wsPerMonitor()` reads `~/.config/hypr/workspaces.conf` at first call and caches the result for the plugin's lifetime. If you change the workspace count, reload the plugin (`make reload`) to pick up the new value.
 - Workspace IDs ≥ 800 are reserved for internal use by Hyprland operations and are never saved to state.
-- The plugin registers four dispatchers: `hawesome:cycle-mode`, `hawesome:cycle-variant`, `hawesome:status`, `hawesome:focus-window`.
+- The plugin registers three dispatchers: `hawesome:cycle-mode`, `hawesome:cycle-variant`, `hawesome:status`.

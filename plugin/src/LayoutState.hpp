@@ -36,7 +36,6 @@ using eHAMasterVariant  = HA::MasterOrientation;
 
 struct SHAState {
     eHAMode          mode              = HA::DWINDLE;
-    bool             dwindleVertical   = false;
     eHAMasterVariant masterOrientation = HA::LEFT;
 };
 

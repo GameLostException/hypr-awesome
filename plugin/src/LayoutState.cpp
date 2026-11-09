@@ -1,14 +1,12 @@
 #include "LayoutState.hpp"
 
 #include <hyprland/src/debug/log/Logger.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
-#include <hyprland/src/plugins/PluginAPI.hpp>
-#include <hyprland/src/state/MonitorState.hpp>
 
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
 #include <array>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Minimal JSON helpers (no external deps)
@@ -54,8 +52,9 @@ std::string CLayoutState::cycleVariant(int wsId, const std::string& monitor) {
     auto& s = get(wsId, monitor);
     switch (s.mode) {
         case eHAMode::DWINDLE:
-            s.dwindleVertical = !s.dwindleVertical;
-            return s.dwindleVertical ? "vertical" : "horizontal";
+            // Dwindle has no workspace-wide orientation: the dispatcher toggles
+            // the focused split, which is not workspace state.
+            return "togglesplit";
         case eHAMode::MASTER:
             s.masterOrientation = static_cast<eHAMasterVariant>(
                 (static_cast<int>(s.masterOrientation) + 1) % 4);
@@ -77,7 +76,6 @@ std::string CLayoutState::modeName(eHAMode m) {
 std::string CLayoutState::variantName(const SHAState& s) {
     switch (s.mode) {
         case eHAMode::DWINDLE:
-            return s.dwindleVertical ? "v" : "h";
         case eHAMode::MONOCLE:
             return "";
         case eHAMode::MASTER:
@@ -281,16 +279,13 @@ void CLayoutState::load() {
         auto it = fields.find("mode");
         if (it != fields.end()) s.mode = modeFromString(it->second);
 
-        it = fields.find("dwindleVertical");
-        if (it != fields.end()) s.dwindleVertical = (it->second == "true");
-
         it = fields.find("masterOrientation");
         if (it != fields.end()) s.masterOrientation = orientFromString(it->second);
 
         m_saved[key] = s;
     }
 
-    Log::logger->log(Log::INFO, "[hawesome] Loaded {} state entries from {}",
+    Log::logger->log(Log::INFO, "hawesome", "Loaded {} state entries from {}",
                      m_saved.size(), statePath());
 }
 
@@ -317,7 +312,6 @@ void CLayoutState::save() const {
         int slot = wsIdToSlot(key.first);
         o << "  \"" << slot << "@" << key.second << "\": {\n"
           << "    \"mode\": \"" << CLayoutState::modeName(s.mode) << "\",\n"
-          << "    \"dwindleVertical\": " << (s.dwindleVertical ? "true" : "false") << ",\n"
           << "    \"masterOrientation\": \"" << CLayoutState::masterOrientName(s.masterOrientation) << "\"\n"
           << "  }";
     }
@@ -326,7 +320,7 @@ void CLayoutState::save() const {
     std::ofstream f(path);
     if (f.is_open()) {
         f << o.str();
-        Log::logger->log(Log::DEBUG, "[hawesome] Saved {} state entries (slot-keyed)",
+        Log::logger->log(Log::DEBUG, "hawesome", "Saved {} state entries (slot-keyed)",
                          m_state.size());
     }
 }
@@ -338,8 +332,8 @@ void CLayoutState::save() const {
 void CLayoutState::onMonitorAdded(const std::string& monitorName) {
     // Nothing to do in state — new workspaces will trigger workspace.created
     // events and get() will lazily restore from m_saved using the slot key.
-    Log::logger->log(Log::INFO,
-        "[hawesome] monitor added: {} — state will be restored lazily on ws creation",
+    Log::logger->log(Log::INFO, "hawesome",
+        "monitor added: {} — state will be restored lazily on ws creation",
         monitorName);
 }
 
@@ -355,7 +349,7 @@ void CLayoutState::onMonitorRemoved(const std::string& monitorName) {
     for (auto& k : toRemove)
         m_state.erase(k);
 
-    Log::logger->log(Log::INFO,
-        "[hawesome] monitor removed: {} — cleared {} runtime state entries (saved preserved)",
+    Log::logger->log(Log::INFO, "hawesome",
+        "monitor removed: {} — cleared {} runtime state entries (saved preserved)",
         monitorName, toRemove.size());
 }

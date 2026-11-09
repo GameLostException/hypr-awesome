@@ -5,7 +5,7 @@ else
 endif
 
 BUILD_DIR = ../build
-SRCS      = main.cpp LayoutState.cpp Dispatchers.cpp
+SRCS      = main.cpp LayoutState.cpp
 OBJS      = $(addprefix $(BUILD_DIR)/, $(SRCS:.cpp=.o))
 TARGET    = $(BUILD_DIR)/hawesome.so
 

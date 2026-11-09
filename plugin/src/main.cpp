@@ -2,9 +2,8 @@
 
 // Hyprland headers must come before any user headers that use Hyprland types
 #include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
-#include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/layout/algorithm/tiled/dwindle/DwindleAlgorithm.hpp>
@@ -18,13 +17,11 @@
 
 // Standard library
 #include <memory>
+#include <optional>
 #include <string>
 #include <fstream>
 #include <sstream>
 #include <thread>
-#include <atomic>
-#include <set>
-#include <mutex>
 #include <cstring>
 
 // POSIX socket for control IPC
@@ -32,12 +29,11 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <signal.h>
-#include <pwd.h>
+
+#include <wayland-server-core.h>
 
 // User headers
 #include "LayoutState.hpp"
-#include "Dispatchers.hpp"
 
 // ---------------------------------------------------------------------------
 // Plugin globals
@@ -46,15 +42,10 @@
 inline HANDLE       PHANDLE = nullptr;
 inline CLayoutState g_state;
 
-// Control socket (replaces the old Python daemon's socket so wayapps can
-// send monocle-swap-begin commands and query status).
-static int          g_ctl_sockfd   = -1;
-static std::thread  g_ctl_thread;
-static std::atomic<bool> g_ctl_running{false};
-
-// Monocle swap suppression: ws_ids currently in a swap, immune to auto-stash.
-static std::mutex       g_monocle_swap_mtx;
-static std::set<int>    g_monocle_swap_pending;
+// Control socket. Its fds are watched by the compositor's own event loop, so
+// every command runs on the main thread, like the rest of the plugin.
+static int              g_ctl_sockfd = -1;
+static wl_event_source* g_ctl_source = nullptr;
 
 // ---------------------------------------------------------------------------
 // Control socket path
@@ -103,41 +94,44 @@ static SP<Layout::CAlgorithm> makeAlgorithm(eHAMode mode, SP<Layout::CSpace> spa
 // Apply state to a workspace
 // ---------------------------------------------------------------------------
 
-static bool isManagedWorkspace(PHLWORKSPACE ws) {
-    if (!ws || !ws->m_space)      return false;
-    if (ws->m_isSpecialWorkspace) return false;
-    if (ws->inert())              return false;
-    if (ws->m_id <= 0)            return false;
-    if (ws->m_id >= 800)          return false;
-    return true;
+// Numbered, non-special workspace with a layout space and an ID below the
+// 800+ range Hyprland reserves for internal use. Returns its numeric ID.
+static std::optional<int> managedWsId(const PHLWORKSPACE& ws) {
+    if (!ws || !ws->space())                                return std::nullopt;
+    if (ws->type() != Workspace::eWorkspaceType::NORMAL)   return std::nullopt;
+    auto id = ws->numberedID();
+    if (!id || *id == 0 || *id >= 800)                     return std::nullopt;
+    return static_cast<int>(*id);
 }
 
-void applyStateToWorkspace(PHLWORKSPACE ws, bool recalc = true) {
-    if (!isManagedWorkspace(ws)) return;
+static std::string monitorName(const PHLWORKSPACE& ws) {
+    auto mon = ws->m_monitor.lock();
+    return mon ? mon->m_name : "";
+}
 
-    int         wsId = ws->m_id;
-    std::string mon  = ws->m_monitor ? ws->m_monitor->m_name : "";
+static void applyStateToWorkspace(const PHLWORKSPACE& ws) {
+    auto wsId = managedWsId(ws);
+    if (!wsId) return;
 
-    const SHAState& s = g_state.get(wsId, mon);
+    std::string     mon   = monitorName(ws);
+    const SHAState& s     = g_state.get(*wsId, mon);
+    auto            space = ws->space();
 
-    if (ws->m_space->algorithm()) {
-        auto newTiled = makeTiledAlgorithm(s.mode);
-        ws->m_space->algorithm()->updateTiledAlgo(std::move(newTiled));
-    } else {
-        ws->m_space->setAlgorithmProvider(makeAlgorithm(s.mode, ws->m_space));
-    }
+    if (space->algorithm())
+        space->algorithm()->updateTiledAlgo(makeTiledAlgorithm(s.mode));
+    else
+        space->setAlgorithmProvider(makeAlgorithm(s.mode, space));
 
     if (s.mode == HA::MASTER) {
         std::string orient = CLayoutState::variantName(s);
         if (!orient.empty())
-            (void)ws->m_space->layoutMsg("orientation" + orient);
+            (void)space->layoutMsg("orientation" + orient);
     }
 
-    if (recalc)
-        ws->m_space->recalculate(Layout::RECALCULATE_REASON_WORKSPACE_CHANGE);
+    space->recalculate(Layout::RECALCULATE_REASON_WORKSPACE_CHANGE);
 
-    Log::logger->log(Log::DEBUG, "[hawesome] Applied {} to ws={} mon={}",
-                     CLayoutState::modeName(s.mode), wsId, mon);
+    Log::logger->log(Log::DEBUG, "hawesome", "Applied {} to ws={} mon={}",
+                     CLayoutState::modeName(s.mode), *wsId, mon);
 }
 
 // ---------------------------------------------------------------------------
@@ -151,21 +145,19 @@ static CHyprSignalListener g_monitorRemovedHook;
 
 // New window on a monocle workspace → focus it so CMonocleAlgorithm brings it to front
 static void onWindowOpen(PHLWINDOW win) {
-    if (!win || !win->m_isMapped) return;
-    if (win->m_isFloating)        return;
+    if (!win || !win->mapped()) return;
+    if (win->isFloating())      return;
 
-    auto ws = win->m_workspace;
-    if (!isManagedWorkspace(ws)) return;
+    auto ws   = win->m_workspace;
+    auto wsId = managedWsId(ws);
+    if (!wsId) return;
 
-    int         wsId = ws->m_id;
-    std::string mon  = ws->m_monitor ? ws->m_monitor->m_name : "";
-
-    const SHAState* s = g_state.peek(wsId, mon);
+    const SHAState* s = g_state.peek(*wsId, monitorName(ws));
     if (!s || s->mode != HA::MONOCLE) return;
 
     Desktop::focusState()->fullWindowFocus(win, Desktop::FOCUS_REASON_NEW_WINDOW);
-    Log::logger->log(Log::INFO, "[hawesome] monocle: focused new window {} on ws={}",
-                     win->m_class, wsId);
+    Log::logger->log(Log::INFO, "hawesome", "monocle: focused new window {} on ws={}",
+                     win->metadata().appID(), *wsId);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,201 +175,162 @@ static PHLWORKSPACE activeWorkspace() {
 // ---------------------------------------------------------------------------
 
 static SDispatchResult dispatchCycleMode(std::string args) {
-    auto ws = activeWorkspace();
-    if (!ws || ws->m_isSpecialWorkspace)
-        return {.success = false, .error = "no active workspace"};
+    auto ws   = activeWorkspace();
+    auto wsId = managedWsId(ws);
+    if (!wsId)
+        return {.success = false, .error = "active workspace is not a managed numbered workspace"};
 
-    int         wsId = ws->m_id;
-    std::string mon  = ws->m_monitor ? ws->m_monitor->m_name : "";
+    std::string mon  = monitorName(ws);
+    eHAMode     mode = g_state.cycleMode(*wsId, mon);
 
-    Log::logger->log(Log::INFO, "[hawesome] cycle-mode called: ws={} mon={}", wsId, mon);
-
-    eHAMode     mode = g_state.cycleMode(wsId, mon);
-    const auto& s    = g_state.get(wsId, mon);
-
-    if (ws->m_space->algorithm()) {
-        ws->m_space->algorithm()->updateTiledAlgo(makeTiledAlgorithm(mode));
-    } else {
-        ws->m_space->setAlgorithmProvider(makeAlgorithm(mode, ws->m_space));
-    }
-
-    if (mode == eHAMode::MASTER) {
-        std::string orient = CLayoutState::variantName(s);
-        if (!orient.empty())
-            (void)ws->m_space->layoutMsg("orientation" + orient);
-    }
-
-    ws->m_space->recalculate(Layout::RECALCULATE_REASON_WORKSPACE_CHANGE);
+    applyStateToWorkspace(ws);
     g_state.save();
     notifyWayapps();
 
-    Log::logger->log(Log::INFO, "[hawesome] cycle-mode ws={} mon={} → {}",
-                     wsId, mon, CLayoutState::modeName(mode));
+    Log::logger->log(Log::INFO, "hawesome", "cycle-mode ws={} mon={} → {}",
+                     *wsId, mon, CLayoutState::modeName(mode));
     return {};
 }
 
 static SDispatchResult dispatchCycleVariant(std::string args) {
-    auto ws = activeWorkspace();
-    if (!ws || ws->m_isSpecialWorkspace)
-        return {.success = false, .error = "no active workspace"};
+    auto ws   = activeWorkspace();
+    auto wsId = managedWsId(ws);
+    if (!wsId)
+        return {.success = false, .error = "active workspace is not a managed numbered workspace"};
 
-    int         wsId = ws->m_id;
-    std::string mon  = ws->m_monitor ? ws->m_monitor->m_name : "";
-    std::string desc = g_state.cycleVariant(wsId, mon);
-    const auto& s    = g_state.get(wsId, mon);
+    std::string mon  = monitorName(ws);
+    std::string desc = g_state.cycleVariant(*wsId, mon);
+    const auto& s    = g_state.get(*wsId, mon);
 
     if (s.mode == eHAMode::DWINDLE) {
-        (void)ws->m_space->layoutMsg("togglesplit");
+        (void)ws->space()->layoutMsg("togglesplit");
     } else if (s.mode == eHAMode::MASTER) {
-        (void)ws->m_space->layoutMsg("orientation" + CLayoutState::variantName(s));
+        (void)ws->space()->layoutMsg("orientation" + CLayoutState::variantName(s));
     }
 
     g_state.save();
     notifyWayapps();
 
-    Log::logger->log(Log::INFO, "[hawesome] cycle-variant ws={} mon={} → {}",
-                     wsId, mon, desc);
+    Log::logger->log(Log::INFO, "hawesome", "cycle-variant ws={} mon={} → {}",
+                     *wsId, mon, desc);
     return {};
 }
 
-// B4 fix: dispatchStatus returns JSON via /tmp/hawesome-status.json AND
-// prints to log. No change to external behaviour but file write is kept
-// for compat; it was always the mechanism since plugins can't return strings
-// to hyprctl callers directly.
+// Monitor by name, or the focused monitor when the name is empty.
+static PHLMONITOR findMonitor(const std::string& name) {
+    if (name.empty())
+        return Desktop::focusState()->monitor();
+    for (auto& m : State::monitorState()->monitors())
+        if (m->m_name == name) return m;
+    return nullptr;
+}
+
+// Layout state of the monitor's active workspace as JSON, or nullopt with
+// the reason in `error`.
+static std::optional<std::string> statusJson(const PHLMONITOR& m, std::string& error) {
+    if (!m) { error = "monitor not found"; return std::nullopt; }
+    auto wsId = managedWsId(m->m_activeWorkspace);
+    if (!wsId) { error = "active workspace is not a managed numbered workspace"; return std::nullopt; }
+    return g_state.toJson(*wsId, m->m_name);
+}
+
+// Writes the status JSON to /tmp/hawesome-status.json and the log: a
+// dispatcher cannot return a string to its hyprctl caller.
 static SDispatchResult dispatchStatus(std::string args) {
     args.erase(0, args.find_first_not_of(" \t"));
 
-    PHLWORKSPACE ws;
-    std::string  mon;
-
-    if (!args.empty()) {
-        for (auto& m : State::monitorState()->monitors()) {
-            if (m->m_name == args) {
-                ws  = m->m_activeWorkspace;
-                mon = m->m_name;
-                break;
-            }
-        }
-    } else {
-        auto m = Desktop::focusState()->monitor();
-        if (m) {
-            ws  = m->m_activeWorkspace;
-            mon = m->m_name;
-        }
-    }
-
-    if (!ws) return {.success = false, .error = "no workspace"};
-
-    std::string json = g_state.toJson(ws->m_id, mon);
+    std::string error;
+    auto        json = statusJson(findMonitor(args), error);
+    if (!json) return {.success = false, .error = error};
     {
         std::ofstream f("/tmp/hawesome-status.json");
-        if (f.is_open()) f << json;
+        if (f.is_open()) f << *json;
     }
 
-    Log::logger->log(Log::INFO, "[hawesome] status: {}", json);
-    return {};
-}
-
-static SDispatchResult dispatchFocusWindow(std::string args) {
-    args.erase(0, args.find_first_not_of(" \t"));
-    if (args.empty())
-        return {.success = false, .error = "no address"};
-
-    std::string addr = args;
-    if (addr.size() > 2 && addr.substr(0, 2) != "0x")
-        addr = "0x" + addr;
-
-    PHLWINDOW target;
-    for (auto& w : Desktop::windowState()->windows()) {
-        if (!w->m_isMapped) continue;
-        std::ostringstream oss;
-        oss << "0x" << std::hex << (uintptr_t)w.get();
-        if (oss.str() == addr) { target = w; break; }
-    }
-
-    if (!target) return {.success = false, .error = "window not found: " + addr};
-
-    Desktop::focusState()->fullWindowFocus(target, Desktop::FOCUS_REASON_KEYBIND);
+    Log::logger->log(Log::INFO, "hawesome", "status: {}", *json);
     return {};
 }
 
 // ---------------------------------------------------------------------------
-// Control socket — B5 fix: provide Unix socket at /tmp/hawesome-<uid>.sock
-// so wayapps can send monocle-swap-begin commands and query status/dump.
-// Runs on a background thread; handles one connection at a time.
+// Control socket at /tmp/hawesome-<uid>.sock — status queries for scripts and
+// status bars. Accept and read happen in event-loop callbacks on the main
+// thread, so Hyprland state and g_state are never touched concurrently.
 // ---------------------------------------------------------------------------
 
 static std::string handleCtlCommand(const std::string& cmd) {
-    if (cmd.rfind("monocle-swap-begin:", 0) == 0) {
-        try {
-            int wsId = std::stoi(cmd.substr(std::string("monocle-swap-begin:").size()));
-            {
-                std::lock_guard<std::mutex> lk(g_monocle_swap_mtx);
-                g_monocle_swap_pending.insert(wsId);
-            }
-            // Remove suppression after 500ms on a detached thread
-            std::thread([wsId]() {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                std::lock_guard<std::mutex> lk(g_monocle_swap_mtx);
-                g_monocle_swap_pending.erase(wsId);
-            }).detach();
-            return "{\"ok\":true}";
-        } catch (...) {
-            return "{\"error\":\"invalid ws_id\"}";
-        }
-    }
-
-    if (cmd == "status") {
-        auto m = Desktop::focusState()->monitor();
-        if (!m) return "{\"error\":\"no focused monitor\"}";
-        auto ws = m->m_activeWorkspace;
-        if (!ws) return "{\"error\":\"no active workspace\"}";
-        return g_state.toJson(ws->m_id, m->m_name);
-    }
-
-    if (cmd.rfind("status:", 0) == 0) {
-        std::string monName = cmd.substr(7);
-        for (auto& m : State::monitorState()->monitors()) {
-            if (m->m_name == monName) {
-                auto ws = m->m_activeWorkspace;
-                if (!ws) return "{\"error\":\"no active workspace\"}";
-                return g_state.toJson(ws->m_id, m->m_name);
-            }
-        }
-        return "{\"error\":\"monitor not found\"}";
+    if (cmd == "status" || cmd.rfind("status:", 0) == 0) {
+        std::string monName = cmd == "status" ? "" : cmd.substr(7);
+        std::string error;
+        auto        json = statusJson(findMonitor(monName), error);
+        return json ? *json : "{\"error\":\"" + error + "\"}";
     }
 
     if (cmd == "dump") {
-        // Return full state as JSON object
-        std::ostringstream o;
-        o << "{";
-        bool first = true;
-        // Access via save path — re-read file for simplicity (avoids lock contention)
-        // Alternatively iterate m_state but that needs a lock; for a debug command
-        // reading the file is fine.
-        std::ifstream f([]() {
-            const char* h = std::getenv("HOME");
-            return std::string(h ? h : "/tmp") + "/.config/hypr-awesome/state.json";
-        }());
-        if (f.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(f)),
-                                 std::istreambuf_iterator<char>());
-            return content;
-        }
+        const char* h = std::getenv("HOME");
+        std::ifstream f(std::string(h ? h : "/tmp") + "/.config/hypr-awesome/state.json");
+        if (f.is_open())
+            return std::string((std::istreambuf_iterator<char>(f)),
+                               std::istreambuf_iterator<char>());
         return "{}";
     }
 
     return "{\"error\":\"unknown command\"}";
 }
 
-static void ctlSocketThread() {
+struct SCtlClient {
+    int              fd     = -1;
+    wl_event_source* source = nullptr;
+};
+
+static void closeCtlClient(SCtlClient* c) {
+    wl_event_source_remove(c->source);
+    ::close(c->fd);
+    delete c;
+}
+
+// Client fd is readable: one command per connection, then close.
+static int onCtlClientReadable(int fd, uint32_t mask, void* data) {
+    auto* c = static_cast<SCtlClient*>(data);
+
+    char    buf[256]{};
+    ssize_t n = (mask & WL_EVENT_READABLE) ? ::recv(fd, buf, sizeof(buf) - 1, 0) : 0;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;   // spurious wakeup — wait for data
+
+    if (n > 0) {
+        std::string cmd(buf, n);
+        while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r' || cmd.back() == ' '))
+            cmd.pop_back();
+
+        std::string reply = handleCtlCommand(cmd) + "\n";
+        ::send(fd, reply.c_str(), reply.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+    }
+
+    closeCtlClient(c);
+    return 0;
+}
+
+static int onCtlListenReadable(int fd, uint32_t, void*) {
+    int client = ::accept4(fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (client < 0) return 0;
+
+    auto* c   = new SCtlClient{.fd = client};
+    c->source = wl_event_loop_add_fd(g_pCompositor->m_wlEventLoop, client,
+                                     WL_EVENT_READABLE, onCtlClientReadable, c);
+    if (!c->source) {
+        ::close(client);
+        delete c;
+    }
+    return 0;
+}
+
+static void startCtlSocket() {
     std::string path = ctlSockPath();
     ::unlink(path.c_str());
 
-    g_ctl_sockfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    g_ctl_sockfd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (g_ctl_sockfd < 0) {
-        Log::logger->log(Log::ERR, "[hawesome] ctl socket create failed: {}",
-                         std::strerror(errno));
+        Log::logger->log(Log::ERR, "hawesome", "ctl socket create failed: {}", std::strerror(errno));
         return;
     }
 
@@ -385,49 +338,25 @@ static void ctlSocketThread() {
     addr.sun_family = AF_UNIX;
     ::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
-    if (::bind(g_ctl_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        Log::logger->log(Log::ERR, "[hawesome] ctl socket bind failed: {}",
-                         std::strerror(errno));
+    if (::bind(g_ctl_sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        ::listen(g_ctl_sockfd, 8) < 0) {
+        Log::logger->log(Log::ERR, "hawesome", "ctl socket bind/listen failed: {}", std::strerror(errno));
         ::close(g_ctl_sockfd);
         g_ctl_sockfd = -1;
         return;
     }
 
-    ::listen(g_ctl_sockfd, 8);
-    Log::logger->log(Log::INFO, "[hawesome] control socket: {}", path);
+    g_ctl_source = wl_event_loop_add_fd(g_pCompositor->m_wlEventLoop, g_ctl_sockfd,
+                                        WL_EVENT_READABLE, onCtlListenReadable, nullptr);
+    Log::logger->log(Log::INFO, "hawesome", "control socket: {}", path);
+}
 
-    while (g_ctl_running) {
-        // Non-blocking accept with timeout so we can check g_ctl_running
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(g_ctl_sockfd, &fds);
-        struct timeval tv{.tv_sec = 1, .tv_usec = 0};
-        int r = ::select(g_ctl_sockfd + 1, &fds, nullptr, nullptr, &tv);
-        if (r <= 0) continue;
-
-        int client = ::accept(g_ctl_sockfd, nullptr, nullptr);
-        if (client < 0) continue;
-
-        // Read command (newline terminated, max 256 bytes)
-        char buf[256]{};
-        ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-            std::string cmd(buf, n);
-            // Trim whitespace/newline
-            while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r'
-                                    || cmd.back() == ' '))
-                cmd.pop_back();
-
-            std::string reply = handleCtlCommand(cmd);
-            reply += "\n";
-            ::send(client, reply.c_str(), reply.size(), MSG_NOSIGNAL);
-        }
-        ::close(client);
-    }
-
-    ::close(g_ctl_sockfd);
-    ::unlink(path.c_str());
+static void stopCtlSocket() {
+    if (g_ctl_source) wl_event_source_remove(g_ctl_source);
+    g_ctl_source = nullptr;
+    if (g_ctl_sockfd >= 0) ::close(g_ctl_sockfd);
     g_ctl_sockfd = -1;
+    ::unlink(ctlSockPath().c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -456,14 +385,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(PHANDLE, "hawesome:cycle-mode",    ::dispatchCycleMode);
     HyprlandAPI::addDispatcherV2(PHANDLE, "hawesome:cycle-variant", ::dispatchCycleVariant);
     HyprlandAPI::addDispatcherV2(PHANDLE, "hawesome:status",        ::dispatchStatus);
-    HyprlandAPI::addDispatcherV2(PHANDLE, "hawesome:focus-window",  ::dispatchFocusWindow);
 
     // Hook workspace creation → apply saved layout
-    g_workspaceCreatedHook = Event::bus()->m_events.workspace.created.listen(
+    // createdLate fires once the workspace is fully set up (monitor, space).
+    g_workspaceCreatedHook = Event::bus()->m_events.workspace.createdLate.listen(
         [](PHLWORKSPACEREF wsRef) {
-            auto ws = wsRef.lock();
-            if (!ws || !isManagedWorkspace(ws)) return;
-            applyStateToWorkspace(ws, false);
+            applyStateToWorkspace(wsRef.lock());
         });
 
     // Hook window open → focus new arrivals on monocle workspaces
@@ -485,11 +412,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
             g_state.onMonitorRemoved(mon->m_name);
         });
 
-    // B5: Start control socket thread
-    g_ctl_running = true;
-    g_ctl_thread  = std::thread(ctlSocketThread);
+    startCtlSocket();
 
-    Log::logger->log(Log::INFO, "[hawesome] Plugin initialised (slot-keyed state)");
+    Log::logger->log(Log::INFO, "hawesome", "Plugin initialised (slot-keyed state)");
     HyprlandAPI::addNotification(PHANDLE, "[hawesome] Loaded",
                                  CHyprColor{0.2, 0.8, 0.4, 1.0}, 3000);
 
@@ -500,10 +425,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 APICALL EXPORT void PLUGIN_EXIT() {
     g_state.save();
 
-    // Stop control socket thread
-    g_ctl_running = false;
-    if (g_ctl_thread.joinable())
-        g_ctl_thread.join();
+    stopCtlSocket();
 
-    Log::logger->log(Log::INFO, "[hawesome] Plugin unloaded");
+    Log::logger->log(Log::INFO, "hawesome", "Plugin unloaded");
 }

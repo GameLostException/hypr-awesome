@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-hawesome-ctl — send commands to the hawesome daemon.
+hawesome-ctl — query the hawesome plugin's control socket.
+
+Layout changes go through the plugin dispatchers, not this socket:
+  hyprctl dispatch hawesome:cycle-mode
+  hyprctl dispatch hawesome:cycle-variant
 
 Usage:
-  hawesome-ctl cycle-mode           # SUP+M  — advance layout mode for current WS×mon
-  hawesome-ctl cycle-variant        # SUP+SHIFT+M — advance variant for current mode
   hawesome-ctl status               # print current (focused) WS×mon layout as JSON
   hawesome-ctl status:<monitor>     # print layout for named monitor's active WS
   hawesome-ctl dump                 # print full state dict as JSON
@@ -33,13 +35,13 @@ def send(cmd: str) -> str:
                 chunks.append(chunk)
             return b"".join(chunks).decode().strip()
     except FileNotFoundError:
-        print("hawesome: daemon not running (socket not found)", file=sys.stderr)
+        print("hawesome: plugin not loaded (socket not found)", file=sys.stderr)
         sys.exit(1)
     except ConnectionRefusedError:
-        print("hawesome: daemon not responding", file=sys.stderr)
+        print("hawesome: plugin not responding", file=sys.stderr)
         sys.exit(1)
     except TimeoutError:
-        print("hawesome: daemon timed out", file=sys.stderr)
+        print("hawesome: plugin timed out", file=sys.stderr)
         sys.exit(1)
 
 
@@ -51,7 +53,7 @@ def main() -> None:
     cmd = sys.argv[1]
 
     # Validate command
-    valid = {"cycle-mode", "cycle-variant", "status", "dump"}
+    valid = {"status", "dump"}
     is_valid = cmd in valid or cmd.startswith("status:")
     if not is_valid:
         print(f"hawesome-ctl: unknown command '{cmd}'", file=sys.stderr)
@@ -63,9 +65,13 @@ def main() -> None:
 
     try:
         parsed = json.loads(reply)
-        print(json.dumps(parsed, indent=2))
     except json.JSONDecodeError:
         print(reply)
+        return
+
+    print(json.dumps(parsed, indent=2))
+    if isinstance(parsed, dict) and "error" in parsed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
