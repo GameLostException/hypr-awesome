@@ -73,34 +73,17 @@ If `pkg-config` can't find the `hyprland` package, the headers aren't installed 
 
 ### split-monitor-workspaces (required for multi-monitor; optional for single-monitor)
 
-[split-monitor-workspaces](https://github.com/Duckonaut/split-monitor-workspaces) is a Hyprland community plugin that gives each monitor its own independent set of workspace slots (1–8, 1–8, 1–8…) instead of sharing one global pool.
+[split-monitor-workspaces](https://github.com/Duckonaut/split-monitor-workspaces) v1.3.0+ is a **pure Lua package** — no `.so` needed. It gives each monitor its own independent set of workspace slots (1–8, 9–16, 17–24…).
 
-**Single-monitor**: you don't need it. Hyprland's default workspace model already gives you slots 1–N on your one monitor.
+**Single-monitor**: you don't need it.
 
-**Multi-monitor**: it is a hard requirement. Without it, workspaces are shared globally across monitors and hypr-awesome's slot-based state persistence will restore the wrong layout on the wrong workspace.
+**Multi-monitor**: it is a hard requirement. Without it, workspaces are shared globally and hypr-awesome's slot-based state will restore the wrong layout on the wrong workspace.
 
-Install via hyprpm:
 ```bash
-hyprpm add https://github.com/Duckonaut/split-monitor-workspaces
-hyprpm enable split-monitor-workspaces
+git clone https://github.com/Duckonaut/split-monitor-workspaces ~/Lab/split-monitor-workspaces
 ```
 
-Configure in `~/.config/hypr/workspaces.conf` (create this file if it doesn't exist):
-```ini
-plugin {
-    split-monitor-workspaces {
-        count = 8
-        keep_focused = 0
-        enable_notifications = 0
-        enable_persistent_workspaces = 1
-    }
-}
-```
-
-Then source it from `hyprland.conf`:
-```ini
-source = ~/.config/hypr/workspaces.conf
-```
+Configure in `hyprland.lua` (see §Hyprland configuration below).
 
 ---
 
@@ -126,59 +109,62 @@ The compiled plugin ends up at `plugin/build/hawesome.so`.
 
 ## Hyprland configuration
 
-Add the following to `~/.config/hypr/hyprland.conf`:
+> **Hyprland v0.57+** uses a Lua config (`hyprland.lua`). All examples use the Lua API.
 
-### 1. Load plugins (order matters)
+### 1. Load plugins
 
-`split-monitor-workspaces` must load **before** `hawesome` so workspace ID ranges are established before hawesome seeds its initial state.
+`hawesome.so` is loaded via `hl.plugin.load()`. `split-monitor-workspaces` is pure Lua — no `.so` needed.
 
-```ini
-# split-monitor-workspaces first — establishes per-monitor workspace ID ranges
-exec-once = hyprctl plugin load /var/cache/hyprpm/YOUR_USER/split-monitor-workspaces/split-monitor-workspaces.so
+```lua
+-- split-monitor-workspaces: pure Lua package
+package.path = package.path .. ";/home/YOUR_USER/Lab/split-monitor-workspaces/lua/?.lua"
+for _, m in ipairs({"split-monitor-workspaces","monitors","globals","helpers","dispatchers"}) do
+    package.loaded[m] = nil  -- clear cache so config.reloaded gets a fresh module
+end
+local smw = require("split-monitor-workspaces")
+local WS_COUNT = 8
+smw.setup({
+    workspace_count              = WS_COUNT,
+    monitor_priority             = { "DP-6", "DP-5", "eDP-1" },
+    keep_focused                 = true,
+    enable_persistent_workspaces = true,
+})
 
-# hawesome second — seeds layout state after workspace ranges are set
-exec-once = hyprctl plugin load /home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so
-```
-
-> The exact path to `split-monitor-workspaces.so` depends on how you installed it.  
-> Check `hyprpm list` or find it with: `find /var/cache/hyprpm -name "split-monitor-workspaces.so"`
-
-Single-monitor users (no split-monitor-workspaces):
-```ini
-exec-once = hyprctl plugin load /home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so
+-- hawesome: requires a compiled .so
+hl.plugin.load("/home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so")
 ```
 
 ### 2. Keybinds
 
-```ini
-$mod = SUPER
+In Hyprland v0.57+, `hyprctl dispatch hawesome:cycle-mode` fails because the lua dispatch
+router cannot parse dispatcher names containing colons. Use `hawesome-ctl.py` instead,
+which sends commands directly to the plugin's Unix socket:
 
-# Cycle layout mode for the current workspace × monitor
-bind = $mod,       m, exec, hyprctl dispatch hawesome:cycle-mode
+```lua
+local mod = "SUPER"
 
-# Cycle layout variant within the current mode (noop on monocle)
-bind = $mod SHIFT, m, exec, hyprctl dispatch hawesome:cycle-variant
+-- Cycle layout mode via hawesome control socket (v0.57 compat)
+hl.bind(mod .. " + m",         hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-mode"))
+hl.bind(mod .. " + SHIFT + m", hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-variant"))
 ```
-
-> **Why `exec, hyprctl dispatch` instead of just `bind = …, hawesome:cycle-mode`?**  
-> Plugins load via `exec-once` *after* the config is parsed. Using `exec, hyprctl dispatch`
-> resolves the dispatcher at keypress time (when the plugin is already loaded), not at
-> config-parse time (when it isn't yet). Using the direct bind syntax causes
-> "Invalid dispatcher" errors on startup.
 
 ### 3. Full example snippet
 
-```ini
-# ~/.config/hypr/hyprland.conf (relevant sections)
+```lua
+-- ~/.config/hypr/hyprland.lua (relevant sections)
 
-source = ~/.config/hypr/workspaces.conf   # split-monitor-workspaces config
+package.path = package.path .. ";/home/YOUR_USER/Lab/split-monitor-workspaces/lua/?.lua"
+for _, m in ipairs({"split-monitor-workspaces","monitors","globals","helpers","dispatchers"}) do package.loaded[m] = nil end
+local smw = require("split-monitor-workspaces")
+local WS_COUNT = 8
+smw.setup({ workspace_count = WS_COUNT, monitor_priority = {"DP-6","DP-5","eDP-1"},
+            keep_focused = true, enable_persistent_workspaces = true })
 
-exec-once = hyprctl plugin load /var/cache/hyprpm/YOUR_USER/split-monitor-workspaces/split-monitor-workspaces.so
-exec-once = hyprctl plugin load /home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so
+hl.plugin.load("/home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so")
 
-$mod = SUPER
-bind = $mod,       m, exec, hyprctl dispatch hawesome:cycle-mode
-bind = $mod SHIFT, m, exec, hyprctl dispatch hawesome:cycle-variant
+local mod = "SUPER"
+hl.bind(mod .. " + m",         hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-mode"))
+hl.bind(mod .. " + SHIFT + m", hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-variant"))
 ```
 
 ---
@@ -218,6 +204,10 @@ Monocle works without wayapps — you can still use `ALT+TAB` or `SUPER+TAB` to 
 python3 ~/.config/hypr/hawesome-ctl.py status           # JSON: current WS×mon state
 python3 ~/.config/hypr/hawesome-ctl.py status:eDP-1     # JSON: named monitor's active WS
 python3 ~/.config/hypr/hawesome-ctl.py dump             # JSON: full persisted state
+
+# Dispatch commands (v0.57 workaround — hyprctl dispatch can't parse colon names)
+python3 ~/.config/hypr/hawesome-ctl.py cycle-mode       # cycle layout mode
+python3 ~/.config/hypr/hawesome-ctl.py cycle-variant    # cycle layout variant
 ```
 
 Example status output:
@@ -257,6 +247,6 @@ State is saved as `slot@monitor` keys (e.g. `"3@DP-5"`). "Slot" is the 1-based p
 
 ## Notes
 
-- `wsPerMonitor()` reads `~/.config/hypr/workspaces.conf` at first call and caches the result for the plugin's lifetime. If you change the workspace count, reload the plugin (`make reload`) to pick up the new value.
-- Workspace IDs ≥ 800 are reserved for internal use by Hyprland operations and are never saved to state.
-- The plugin registers three dispatchers: `hawesome:cycle-mode`, `hawesome:cycle-variant`, `hawesome:status`.
+- `wsPerMonitor()` reads `workspace_count` from `~/.config/hypr/hyprland.lua` at first call and caches the result. If you change the workspace count, reload Hyprland (`hyprctl reload`) to pick up the new value.
+- Workspace IDs ≥ 800 are reserved for internal use by Hyprland and are never saved to state.
+- The plugin registers three dispatchers: `hawesome:cycle-mode`, `hawesome:cycle-variant`, `hawesome:status`. In Hyprland v0.57+, call these via `hawesome-ctl.py` rather than `hyprctl dispatch` (which cannot parse colon-containing names through its Lua router).

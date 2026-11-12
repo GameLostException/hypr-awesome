@@ -274,6 +274,18 @@ static std::string handleCtlCommand(const std::string& cmd) {
         return "{}";
     }
 
+    // Dispatch commands — allow scripts to trigger dispatchers via the control socket.
+    // This is the workaround for Hyprland v0.57 where hyprctl dispatch can no longer
+    // parse plugin dispatcher names containing colons/dashes via the lua router.
+    if (cmd == "cycle-mode") {
+        SDispatchResult r = dispatchCycleMode("");
+        return r.success ? "ok" : "{\"error\":\"" + r.error + "\"}";
+    }
+    if (cmd == "cycle-variant") {
+        SDispatchResult r = dispatchCycleVariant("");
+        return r.success ? "ok" : "{\"error\":\"" + r.error + "\"}";
+    }
+
     return "{\"error\":\"unknown command\"}";
 }
 
