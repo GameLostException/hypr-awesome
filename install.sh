@@ -1,36 +1,39 @@
 #!/usr/bin/env bash
-# install.sh — wire hypr-awesome into Hyprland config
+# install.sh — build and wire hypr-awesome into Hyprland config
 #
 # What this does:
-#   1. Makes hawesome.py and hawesome-ctl.py executable
-#   2. Creates symlinks in ~/.config/hypr/ for convenience
-#   3. Prints the hyprland.conf snippets to add (does NOT modify the file automatically)
+#   1. Builds the plugin .so
+#   2. Makes hawesome-ctl.py executable and symlinks it into ~/.config/hypr/
+#   3. Prints the hyprland.lua snippets to add (does NOT modify the file automatically)
+#
+# Hyprland v0.57+: plugins load via hl.plugin.load() in hyprland.lua.
+# Layout dispatchers are called via hawesome-ctl.py (control socket) since
+# hyprctl dispatch cannot parse 'hawesome:cycle-mode' through the lua router.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 HYPR_CFG="$HOME/.config/hypr"
 
-echo "==> Making scripts executable"
-chmod +x "$REPO_DIR/hawesome.py"
+echo "==> Building plugin"
+make -C "$REPO_DIR/plugin/src" -j"$(nproc)"
+
+echo "==> Making hawesome-ctl.py executable"
 chmod +x "$REPO_DIR/hawesome-ctl.py"
 
-echo "==> Creating symlinks in $HYPR_CFG"
-ln -sf "$REPO_DIR/hawesome.py"     "$HYPR_CFG/hawesome.py"
+echo "==> Creating symlink in $HYPR_CFG"
 ln -sf "$REPO_DIR/hawesome-ctl.py" "$HYPR_CFG/hawesome-ctl.py"
 
 echo ""
-echo "==> Done. Add the following to ~/.config/hypr/hyprland.conf:"
+echo "==> Done. Add the following to ~/.config/hypr/hyprland.lua:"
 echo ""
-echo "# ─── hypr-awesome ────────────────────────────────────────────────────────────"
-echo "exec-once = python3 $REPO_DIR/hawesome.py"
+echo "-- ─── hypr-awesome ──────────────────────────────────────────────────────────"
+echo "hl.plugin.load(\"$REPO_DIR/plugin/build/hawesome.so\")"
 echo ""
-echo "# Layout mode cycle (replaces toggle-monocle.sh)"
-echo "bind = \$mod,       m, exec, python3 $REPO_DIR/hawesome-ctl.py cycle-mode"
-echo "# Layout variant cycle (replaces toggle-split.sh)"
-echo "bind = \$mod SHIFT, m, exec, python3 $REPO_DIR/hawesome-ctl.py cycle-variant"
+echo "-- Layout mode cycle (uses hawesome-ctl.py control socket — hyprctl dispatch"
+echo "-- cannot parse 'hawesome:cycle-mode' in Hyprland v0.57+ lua router)"
+echo "hl.bind(mod .. \" + m\",         hl.dsp.exec_cmd(\"python3 $REPO_DIR/hawesome-ctl.py cycle-mode\"))"
+echo "hl.bind(mod .. \" + SHIFT + m\", hl.dsp.exec_cmd(\"python3 $REPO_DIR/hawesome-ctl.py cycle-variant\"))"
 echo ""
-echo "==> Also REMOVE or COMMENT OUT these old binds from hyprland.conf:"
-echo "    bind = \$mod,       m,         fullscreen, 1"
-echo "    bind = \$mod,       m,         exec, ~/.config/hypr/toggle-monocle.sh"
-echo "    bind = \$mod SHIFT, m,         exec, ~/.config/hypr/toggle-split.sh"
+echo "==> After a Hyprland upgrade, rebuild before the next boot:"
+echo "    cd $REPO_DIR/plugin/src && make clean && make -j\$(nproc)"

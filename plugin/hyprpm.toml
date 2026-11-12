@@ -1,0 +1,9 @@
+[repository]
+name = "hypr-awesome"
+authors = ["boris"]
+
+[hawesome]
+description = "Per-workspace × per-monitor tiling layout (dwindle/monocle/master)"
+authors = ["boris"]
+output = "plugin/build/hawesome.so"
+build = ["make -C plugin/src all"]

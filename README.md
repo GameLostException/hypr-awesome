@@ -1,95 +1,252 @@
 # hypr-awesome
 
-Per-workspace × per-monitor tiling layout daemon for Hyprland.  
-Inspired by AwesomeWM's per-tag layout model.
+Per-workspace × per-monitor tiling layout plugin for Hyprland.  
+Inspired by AwesomeWM's per-tag layout model — each workspace on each monitor independently remembers its own layout mode and variant.
 
-## Concept
+```
+WS 1  → dwindle     WS 2  → master/left   WS 3  → monocle
+WS 1  → master/top  WS 4  → dwindle       ← different monitor, different state
+```
 
-Each **(workspace, monitor)** combination independently remembers its own:
-- **layout mode** — `dwindle`, `monocle`, or `master`
-- **variant** — sub-state within the mode (dwindle split direction, master orientation)
+Switching workspace or monitor focus instantly restores the saved layout — no manual re-applying.
 
-Switching workspace or monitor focus automatically restores the saved layout for that combo.
+---
 
-## Layout modes
+## What it does
 
-| Mode | Description | Variants (`SUP+SHIFT+M`) |
-|------|-------------|--------------------------|
-| `dwindle` | Binary space partition | `h` (horizontal) ↔ `v` (vertical) |
-| `monocle` | One window at a time; hover taskbar to cycle | — (no variants) |
-| `master` | One master + slave stack | `left` → `top` → `right` → `bottom` |
+### Layout modes
 
-## Keybinds
+| Mode | Description |
+|------|-------------|
+| `dwindle` | Binary space partition — new windows split the focused tile |
+| `monocle` | One window fills the workspace; others stack behind it |
+| `master` | One master window on one side; remaining windows in a slave stack |
+
+### Variants (sub-state within a mode)
+
+| Mode | Variants (cycle with `SUPER+SHIFT+M`) |
+|------|---------------------------------------|
+| `dwindle` | none saved — `SUPER+SHIFT+M` toggles the focused split (`togglesplit`) |
+| `monocle` | none |
+| `master` | `left` → `top` → `right` → `bottom` (master window position) |
+
+### Keybinds
 
 | Bind | Action |
 |------|--------|
-| `SUP+M` | Cycle layout mode for current WS×mon: dwindle → monocle → master → … |
-| `SUP+SHIFT+M` | Cycle variant for current mode (noop on monocle) |
+| `SUPER+M` | Cycle mode: dwindle → monocle → master → dwindle… |
+| `SUPER+SHIFT+M` | Cycle variant within current mode (noop on monocle) |
 
-## Monocle implementation
+State is saved to `~/.config/hypr-awesome/state.json` and restored on restart.
 
-Monocle is **not** a Hyprland layout engine. It is simulated by hawesome:
+---
 
-- **Enter**: all non-active tiled windows are moved to `special:monocle{ws_id}` (a hidden special workspace). The active window naturally expands to fill the space.
-- **Cycle** (`SUP+M` again while in monocle): the next stashed window is brought forward, the current one is stashed.
-- **Taskbar integration**: [wayapps](../wayapps/) includes stashed windows in the taskbar so you can hover or click to switch between them directly.
-- **Exit** (cycle to dwindle/master): all stashed windows are restored before the engine switch.
-- **Daemon restart**: any `special:monocleN` workspaces left from a previous session are automatically cleaned up on startup.
+## Requirements
 
-## Layout engine switching (dwindle ↔ master)
+### System
 
-Hyprland assigns a tiling engine to each workspace permanently at creation. `general:layout` only affects newly created workspaces. To change an existing workspace's engine, hawesome:
+| Requirement | Notes |
+|-------------|-------|
+| [Hyprland](https://hyprland.org/) | 0.57 or later (the plugin is built against its internal headers) |
+| C++23 compiler (`g++` or `clang++`) | For building the plugin |
+| `pkg-config` | For build flags resolution |
+| Hyprland development headers | See below |
 
-1. Sets `general:layout` to the target engine
-2. Moves the monitor to a temporary workspace `800+ws_id` (so the target workspace can be destroyed)
-3. Empties the target workspace → Hyprland destroys it
-4. Switches back → Hyprland recreates it under the new engine
-5. Moves all windows back → they tile under the new engine
+### Hyprland headers
 
-Focus events fired during this operation are suppressed via `_switching` flag + `asyncio.sleep(0.3)` drain.
+The plugin compiles against Hyprland's own headers. You need the development package for your distro:
 
-## Hyprland layout constraint
-
-`general:layout` is a single global keyword — no per-monitor or per-workspace layout API exists. hawesome works around this:
-
-- On focus change, `general:layout` is set to the incoming WS×mon's mode. This only matters for newly-opened windows; existing window positions are preserved per-workspace by Hyprland natively.
-- **Real limitation**: two monitors cannot simultaneously use different engines for new windows. If you open a new window while focused on a monitor with a different mode than its neighbor, the new window uses the focused monitor's engine. This is a Hyprland constraint, not a hawesome bug.
-
-## Architecture
-
-```
-hawesome.py        daemon — asyncio IPC listener + control socket server
-hawesome-ctl.py    CLI — sends commands to daemon (called by keybinds)
+```bash
+# Arch Linux (AUR)
+yay -S hyprland-devel
+# or:
+paru -S hyprland-devel
 ```
 
-State is persisted to `~/.config/hypr-awesome/state.json` as `slot@monitor` keys.  
-Control socket: `/tmp/hawesome-{uid}.sock`
+Verify the headers are found:
+```bash
+pkg-config --cflags hyprland
+# should print something like: -I/usr/include/hyprland ...
+```
+
+If `pkg-config` can't find the `hyprland` package, the headers aren't installed — the build will fail with "package hyprland was not found".
+
+### split-monitor-workspaces (required for multi-monitor; optional for single-monitor)
+
+[split-monitor-workspaces](https://github.com/Duckonaut/split-monitor-workspaces) v1.3.0+ is a **pure Lua package** — no `.so` needed. It gives each monitor its own independent set of workspace slots (1–8, 9–16, 17–24…).
+
+**Single-monitor**: you don't need it.
+
+**Multi-monitor**: it is a hard requirement. Without it, workspaces are shared globally and hypr-awesome's slot-based state will restore the wrong layout on the wrong workspace.
+
+```bash
+git clone https://github.com/Duckonaut/split-monitor-workspaces ~/Lab/split-monitor-workspaces
+```
+
+Configure in `hyprland.lua` (see §Hyprland configuration below).
+
+---
 
 ## Install
 
 ```bash
+git clone https://github.com/GameLostException/hypr-awesome.git ~/Lab/hypr-awesome
 cd ~/Lab/hypr-awesome
 bash install.sh
 ```
 
-Add to `hyprland.conf`:
-```ini
-exec-once = python3 ~/Lab/hypr-awesome/hawesome.py
+`install.sh` builds the plugin `.so` and symlinks `hawesome-ctl.py` into `~/.config/hypr/`.
+
+Or build manually:
+```bash
+cd ~/Lab/hypr-awesome/plugin/src
+make -j$(nproc)
 ```
 
-## Control socket commands
+The compiled plugin ends up at `plugin/build/hawesome.so`.
+
+---
+
+## Hyprland configuration
+
+> **Hyprland v0.57+** uses a Lua config (`hyprland.lua`). All examples use the Lua API.
+
+### 1. Load plugins
+
+`hawesome.so` is loaded via `hl.plugin.load()`. `split-monitor-workspaces` is pure Lua — no `.so` needed.
+
+```lua
+-- split-monitor-workspaces: pure Lua package
+package.path = package.path .. ";/home/YOUR_USER/Lab/split-monitor-workspaces/lua/?.lua"
+for _, m in ipairs({"split-monitor-workspaces","monitors","globals","helpers","dispatchers"}) do
+    package.loaded[m] = nil  -- clear cache so config.reloaded gets a fresh module
+end
+local smw = require("split-monitor-workspaces")
+local WS_COUNT = 8
+smw.setup({
+    workspace_count              = WS_COUNT,
+    monitor_priority             = { "DP-6", "DP-5", "eDP-1" },
+    keep_focused                 = true,
+    enable_persistent_workspaces = true,
+})
+
+-- hawesome: requires a compiled .so
+hl.plugin.load("/home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so")
+```
+
+### 2. Keybinds
+
+In Hyprland v0.57+, `hyprctl dispatch hawesome:cycle-mode` fails because the lua dispatch
+router cannot parse dispatcher names containing colons. Use `hawesome-ctl.py` instead,
+which sends commands directly to the plugin's Unix socket:
+
+```lua
+local mod = "SUPER"
+
+-- Cycle layout mode via hawesome control socket (v0.57 compat)
+hl.bind(mod .. " + m",         hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-mode"))
+hl.bind(mod .. " + SHIFT + m", hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-variant"))
+```
+
+### 3. Full example snippet
+
+```lua
+-- ~/.config/hypr/hyprland.lua (relevant sections)
+
+package.path = package.path .. ";/home/YOUR_USER/Lab/split-monitor-workspaces/lua/?.lua"
+for _, m in ipairs({"split-monitor-workspaces","monitors","globals","helpers","dispatchers"}) do package.loaded[m] = nil end
+local smw = require("split-monitor-workspaces")
+local WS_COUNT = 8
+smw.setup({ workspace_count = WS_COUNT, monitor_priority = {"DP-6","DP-5","eDP-1"},
+            keep_focused = true, enable_persistent_workspaces = true })
+
+hl.plugin.load("/home/YOUR_USER/Lab/hypr-awesome/plugin/build/hawesome.so")
+
+local mod = "SUPER"
+hl.bind(mod .. " + m",         hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-mode"))
+hl.bind(mod .. " + SHIFT + m", hl.dsp.exec_cmd("python3 ~/.config/hypr/hawesome-ctl.py cycle-variant"))
+```
+
+---
+
+## After a Hyprland upgrade
+
+The plugin compiles against Hyprland's internal headers. After any Hyprland update, rebuild before the next session or the plugin will refuse to load with a "Version mismatch" notification:
 
 ```bash
-hawesome-ctl.py cycle-mode        # advance layout mode for current WS×mon
-hawesome-ctl.py cycle-variant     # advance variant for current mode
-hawesome-ctl.py status            # JSON: current WS×mon state
-hawesome-ctl.py status:eDP-1      # JSON: named monitor's active WS state
-hawesome-ctl.py dump              # JSON: full in-memory state
+cd ~/Lab/hypr-awesome/plugin/src && make clean && make -j$(nproc)
 ```
+
+Or from the repo root:
+```bash
+make reload   # build + unload old + load new into the running session
+```
+
+---
+
+## Monocle mode
+
+Monocle uses Hyprland's native `CMonocleAlgorithm`. All windows remain on the workspace — Hyprland stacks them with the focused window filling the space. There are no hidden special workspaces.
+
+- **Entering**: press `SUPER+M` until you reach monocle. The focused window fills the workspace; others are behind it.
+- **Cycling through windows**: click or hover a button in the [wayapps](../wayapps/) taskbar. The clicked window comes to the front.
+- **Exiting**: press `SUPER+M` to advance to master or back to dwindle. The algorithm switches back live.
+
+Monocle works without wayapps — you can still use `ALT+TAB` or `SUPER+TAB` to cycle windows. wayapps just makes it more visual.
+
+---
+
+## Control socket (for scripting / status bars)
+
+`hawesome-ctl.py` queries the plugin's Unix socket at `/tmp/hawesome-{uid}.sock`:
+
+```bash
+python3 ~/.config/hypr/hawesome-ctl.py status           # JSON: current WS×mon state
+python3 ~/.config/hypr/hawesome-ctl.py status:eDP-1     # JSON: named monitor's active WS
+python3 ~/.config/hypr/hawesome-ctl.py dump             # JSON: full persisted state
+
+# Dispatch commands (v0.57 workaround — hyprctl dispatch can't parse colon names)
+python3 ~/.config/hypr/hawesome-ctl.py cycle-mode       # cycle layout mode
+python3 ~/.config/hypr/hawesome-ctl.py cycle-variant    # cycle layout variant
+```
+
+Example status output:
+```json
+{
+  "ws": 3,
+  "mon": "DP-5",
+  "mode": "master",
+  "variant": "left"
+}
+```
+
+---
+
+## Live reload (during development)
+
+```bash
+make reload   # from repo root: build → unload old .so → load new .so
+```
+
+---
+
+## Architecture
+
+```
+plugin/src/main.cpp         Plugin entry point — dispatchers, event hooks, control socket
+plugin/src/LayoutState.cpp  Per-WS×monitor state — slot-keyed persistence, monitor lifecycle
+plugin/src/LayoutState.hpp  State types (SHAState, CLayoutState)
+hawesome-ctl.py             CLI client for the plugin's control socket
+install.sh                  Build + symlink installer
+Makefile                    build / reload / clean targets
+```
+
+State is saved as `slot@monitor` keys (e.g. `"3@DP-5"`). "Slot" is the 1-based position within a monitor's workspace range, independent of monitor index — so state survives monitor reordering (e.g. unplugging DP-5 and re-plugging it as a different index).
+
+---
 
 ## Notes
 
-- Requires Hyprland with `split-monitor-workspaces` plugin
-- State file uses `slot@monitor` keys (e.g. `"3@DP-5"`) for stability across restarts
-- Temp workspace IDs ≥ 800 are used during engine switches and never saved to state
-- `general:layout` is only issued when it differs from the last known value, to avoid disturbing other monitors on focus change
+- `wsPerMonitor()` reads `workspace_count` from `~/.config/hypr/hyprland.lua` at first call and caches the result. If you change the workspace count, reload Hyprland (`hyprctl reload`) to pick up the new value.
+- Workspace IDs ≥ 800 are reserved for internal use by Hyprland and are never saved to state.
+- The plugin registers three dispatchers: `hawesome:cycle-mode`, `hawesome:cycle-variant`, `hawesome:status`. In Hyprland v0.57+, call these via `hawesome-ctl.py` rather than `hyprctl dispatch` (which cannot parse colon-containing names through its Lua router).
